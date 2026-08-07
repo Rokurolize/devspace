@@ -66,6 +66,34 @@ test("expired and adopted workspace activity leases recover safely", async () =>
   }
 });
 
+test("adopting a near-expiry lease renews it atomically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-adopt-test-"));
+  let now = 1_000;
+  const first = new WorkspaceActivityStore(root, { now: () => now, ttlMs: 100 });
+  const second = new WorkspaceActivityStore(root, { now: () => now, ttlMs: 100 });
+  try {
+    const original = first.acquireShared("ws_adopt", "local_agent", "agent");
+    now = 1_090;
+    const adopted = second.adopt(original.id, "ws_adopt", "local_agent");
+
+    now = 1_150;
+    assert.throws(
+      () => first.acquireClose("ws_adopt", "close"),
+      (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "active",
+    );
+
+    now = 1_191;
+    const close = first.acquireClose("ws_adopt", "close");
+    close.release();
+    adopted.release();
+    original.release();
+  } finally {
+    first.close();
+    second.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("workspace activity heartbeat retries after a transient refresh failure", async () => {
   let attempts = 0;
   const stopHeartbeat = startWorkspaceActivityHeartbeat({

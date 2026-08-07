@@ -11,6 +11,12 @@ export interface KillableProcess {
   kill(signal?: NodeJS.Signals): boolean;
 }
 
+export interface SpawnObservedProcess {
+  on(event: "error", listener: (error: Error) => void): this;
+  once(event: "spawn", listener: () => void): this;
+  unref(): void;
+}
+
 interface ProcessTreeRuntime {
   platform: NodeJS.Platform;
   killGroup(pid: number, signal: NodeJS.Signals): void;
@@ -74,4 +80,21 @@ export function terminateProcessTree(
   }
 
   child.kill(signal);
+}
+
+export function waitForChildSpawn(child: SpawnObservedProcess): Promise<void> {
+  return new Promise((resolveSpawn, rejectSpawn) => {
+    let settled = false;
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      rejectSpawn(error);
+    });
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      child.unref();
+      resolveSpawn();
+    });
+  });
 }

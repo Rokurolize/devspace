@@ -38,6 +38,7 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import { waitForChildSpawn } from "./process-platform.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import {
   applyWorkspaceReconcile,
@@ -517,7 +518,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
       error: undefined,
     });
     try {
-      spawnAgentWorkerWithActivity(config, existing, promptFile);
+      await spawnAgentWorkerWithActivity(config, existing, promptFile);
     } catch (error) {
       store.update(existing.id, {
         status: "error",
@@ -554,7 +555,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
   });
 
   try {
-    spawnAgentWorkerWithActivity(config, record, promptFile);
+    await spawnAgentWorkerWithActivity(config, record, promptFile);
   } catch (error) {
     store.update(record.id, {
       status: "error",
@@ -690,11 +691,11 @@ async function runRawLocalAgentProvider(
   });
 }
 
-function spawnAgentWorker(
+async function spawnAgentWorker(
   agentId: string,
   promptFile: string,
   activityLeaseId?: string,
-): void {
+): Promise<void> {
   const child = spawn(process.execPath, [
     ...process.execArgv,
     fileURLToPath(import.meta.url),
@@ -709,16 +710,16 @@ function spawnAgentWorker(
     stdio: "ignore",
     env: process.env,
   });
-  child.unref();
+  await waitForChildSpawn(child);
 }
 
-function spawnAgentWorkerWithActivity(
+async function spawnAgentWorkerWithActivity(
   config: ServerConfig,
   record: LocalAgentRecord,
   promptFile: string,
-): void {
+): Promise<void> {
   if (!record.workspaceId) {
-    spawnAgentWorker(record.id, promptFile);
+    await spawnAgentWorker(record.id, promptFile);
     return;
   }
 
@@ -729,7 +730,7 @@ function spawnAgentWorkerWithActivity(
     record.id,
   );
   try {
-    spawnAgentWorker(record.id, promptFile, activityLease.id);
+    await spawnAgentWorker(record.id, promptFile, activityLease.id);
   } catch (error) {
     activityLease.release();
     throw error;

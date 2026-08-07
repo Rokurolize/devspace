@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import { EventEmitter } from "node:events";
+import {
+  resolveShellCommand,
+  terminateProcessTree,
+  waitForChildSpawn,
+  type SpawnObservedProcess,
+} from "./process-platform.js";
 
 assert.deepEqual(resolveShellCommand("echo ok", "win32", { ComSpec: "C:\\Windows\\cmd.exe" }), {
   executable: "C:\\Windows\\cmd.exe",
@@ -59,3 +65,23 @@ terminateProcessTree(
   },
 );
 assert.deepEqual(fallbackCalls, ["child:SIGTERM"]);
+
+class FakeSpawnedProcess extends EventEmitter implements SpawnObservedProcess {
+  unrefCalled = false;
+
+  unref(): void {
+    this.unrefCalled = true;
+  }
+}
+
+const spawned = new FakeSpawnedProcess();
+const spawnedResult = waitForChildSpawn(spawned);
+spawned.emit("spawn");
+await spawnedResult;
+assert.equal(spawned.unrefCalled, true);
+
+const failedSpawn = new FakeSpawnedProcess();
+const failedResult = waitForChildSpawn(failedSpawn);
+failedSpawn.emit("error", new Error("simulated spawn failure"));
+await assert.rejects(failedResult, /simulated spawn failure/);
+assert.equal(failedSpawn.unrefCalled, false);

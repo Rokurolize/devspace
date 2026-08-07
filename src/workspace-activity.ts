@@ -33,14 +33,6 @@ export interface WorkspaceActivityStoreOptions {
   ttlMs?: number;
 }
 
-interface WorkspaceActivityRow {
-  lease_id: string;
-  workspace_id: string;
-  kind: string;
-  owner_id: string;
-  expires_at: number;
-}
-
 export class WorkspaceActivityStore {
   private readonly database: DatabaseHandle;
   private readonly now: () => number;
@@ -72,19 +64,32 @@ export class WorkspaceActivityStore {
     workspaceId: string,
     kind: Exclude<WorkspaceActivityKind, "close">,
   ): WorkspaceActivityLease {
-    const now = this.now();
-    this.deleteExpired(now);
-    const row = this.database.sqlite
-      .prepare(
-        `select lease_id, workspace_id, kind, owner_id, expires_at
-         from workspace_activity_leases
-         where lease_id = ?`,
-      )
-      .get(leaseId) as WorkspaceActivityRow | undefined;
-    if (!row || row.workspace_id !== workspaceId || row.kind !== kind || row.expires_at <= now) {
-      throw new Error(`Workspace activity lease is missing or expired: ${leaseId}`);
-    }
-    return this.lease(row.lease_id, row.workspace_id, kind);
+    const adopt = this.database.sqlite.transaction(() => {
+      const now = this.now();
+      this.deleteExpired(now);
+      const result = this.database.sqlite
+        .prepare(
+          `update workspace_activity_leases
+           set expires_at = ?, updated_at = ?
+           where lease_id = ?
+             and workspace_id = ?
+             and kind = ?
+             and expires_at > ?`,
+        )
+        .run(
+          now + this.ttlMs,
+          new Date(now).toISOString(),
+          leaseId,
+          workspaceId,
+          kind,
+          now,
+        );
+      if (result.changes !== 1) {
+        throw new Error(`Workspace activity lease is missing or expired: ${leaseId}`);
+      }
+    });
+    adopt.immediate();
+    return this.lease(leaseId, workspaceId, kind);
   }
 
   close(): void {
