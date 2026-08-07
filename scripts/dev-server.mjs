@@ -26,6 +26,7 @@ const serverCommand = commandFromEnvironment(
 
 let serverChild;
 let uiChild;
+let initialBuildChild;
 let restartTimer;
 let restartingServer = false;
 let shuttingDown = false;
@@ -66,8 +67,17 @@ function spawnCommand(command, extraEnv = {}) {
 
 async function runInitialUiBuild() {
   log("building the initial MCP app bundle");
-  const child = spawnCommand(initialBuildCommand);
-  const result = await waitForExit(child);
+  initialBuildChild = spawnCommand(initialBuildCommand);
+  const current = initialBuildChild;
+  let result;
+  try {
+    result = await waitForExit(current);
+  } finally {
+    if (initialBuildChild === current) initialBuildChild = undefined;
+  }
+  if (shuttingDown) {
+    throw new Error("initial MCP app build was interrupted by shutdown");
+  }
   if (result.code !== 0) {
     throw new Error(
       `initial MCP app build failed (${result.signal ?? result.code ?? "unknown"})`,
@@ -194,6 +204,7 @@ async function shutdown(exitCode = 0) {
   clearTimeout(restartTimer);
   for (const watcher of watchers) watcher.close();
   await Promise.all([
+    terminateChild(initialBuildChild),
     terminateChild(serverChild),
     terminateChild(uiChild),
   ]);

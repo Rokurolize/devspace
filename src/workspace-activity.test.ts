@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  startWorkspaceActivityHeartbeat,
   WorkspaceActivityStore,
   WorkspaceBusyError,
 } from "./workspace-activity.js";
@@ -62,5 +63,29 @@ test("expired and adopted workspace activity leases recover safely", async () =>
     first.close();
     second.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace activity heartbeat retries after a transient refresh failure", async () => {
+  let attempts = 0;
+  const stopHeartbeat = startWorkspaceActivityHeartbeat({
+    id: "lease-retry",
+    workspaceId: "ws_retry",
+    kind: "operation",
+    heartbeatIntervalMs: 10,
+    heartbeat: () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient database lock");
+    },
+    release: () => undefined,
+  });
+  try {
+    const deadline = Date.now() + 1_000;
+    while (attempts < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(attempts >= 2);
+  } finally {
+    stopHeartbeat();
   }
 });

@@ -38,6 +38,7 @@ try {
     ].join("\n"),
   );
   await testUiAndBackendWatches(join(root, "watching"));
+  await testShutdownDuringInitialBuild(join(root, "initial-shutdown"));
   await testInitialBuildFailure(join(root, "initial-failure"));
 } finally {
   await rm(root, { recursive: true, force: true });
@@ -81,6 +82,21 @@ async function testInitialBuildFailure(testRoot) {
   assert.notEqual(result.code, 0);
   const lines = await logLines(logPath);
   assert.equal(hasStarts(lines, "initial", 1), true);
+  assert.equal(hasStarts(lines, "ui-watch", 1), false);
+  assert.equal(hasStarts(lines, "server", 1), false);
+}
+
+async function testShutdownDuringInitialBuild(testRoot) {
+  const logPath = join(testRoot, "children.log");
+  await mkdir(join(testRoot, "src", "ui"), { recursive: true });
+  const supervisor = startSupervisor(testRoot, logPath);
+  await waitForLog(logPath, (lines) => hasStarts(lines, "initial", 1));
+  supervisor.kill("SIGTERM");
+
+  const result = await waitForExit(supervisor);
+  assert.equal(result.code, 0);
+  const lines = await logLines(logPath);
+  assert.equal(hasStops(lines, "initial"), true);
   assert.equal(hasStarts(lines, "ui-watch", 1), false);
   assert.equal(hasStarts(lines, "server", 1), false);
 }
@@ -140,6 +156,9 @@ function hasStops(lines, kind) {
 }
 
 function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
   return new Promise((resolveExit, reject) => {
     child.once("error", reject);
     child.once("exit", (code, signal) => resolveExit({ code, signal }));

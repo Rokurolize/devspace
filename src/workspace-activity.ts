@@ -182,7 +182,8 @@ export function startWorkspaceActivityHeartbeat(
     try {
       lease.heartbeat();
     } catch {
-      clearInterval(timer);
+      // Keep retrying. A transient SQLite lock must not silently turn a live
+      // activity into an expired lease while the owning operation continues.
     }
   }, lease.heartbeatIntervalMs);
   timer.unref();
