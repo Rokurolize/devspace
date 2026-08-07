@@ -161,9 +161,14 @@ export class WorkspaceActivityStore {
       release: () => {
         if (released) return;
         released = true;
-        this.database.sqlite
-          .prepare("delete from workspace_activity_leases where lease_id = ?")
-          .run(leaseId);
+        try {
+          this.database.sqlite
+            .prepare("delete from workspace_activity_leases where lease_id = ?")
+            .run(leaseId);
+        } catch {
+          // Do not let cleanup failure escape a process or tool completion
+          // callback. The row remains fail-closed until its bounded expiry.
+        }
       },
     };
   }

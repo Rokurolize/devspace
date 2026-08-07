@@ -59,6 +59,26 @@ const environment = await manager.start({
 assert.equal(environment.running, false);
 assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
 
+const releaseFailure = await manager.start({
+  workspaceId: "workspace-release-failure",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('release-safe')"`,
+  yieldTimeMs: 2_000,
+  activityLease: {
+    id: "lease-release-failure",
+    workspaceId: "workspace-release-failure",
+    kind: "process",
+    heartbeatIntervalMs: 25,
+    heartbeat: () => undefined,
+    release: () => {
+      throw new Error("simulated release failure");
+    },
+  },
+});
+assert.equal(releaseFailure.running, false);
+assert.equal(releaseFailure.exitCode, 0);
+assert.match(releaseFailure.output, /release-safe/);
+
 const background = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),

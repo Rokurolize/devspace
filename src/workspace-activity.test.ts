@@ -89,3 +89,12 @@ test("workspace activity heartbeat retries after a transient refresh failure", a
     stopHeartbeat();
   }
 });
+
+test("workspace activity release remains safe after its store becomes unavailable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-release-test-"));
+  const store = new WorkspaceActivityStore(root);
+  const lease = store.acquireShared("ws_release", "operation", "release-test");
+  store.close();
+  assert.doesNotThrow(() => lease.release());
+  await rm(root, { recursive: true, force: true });
+});

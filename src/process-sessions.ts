@@ -434,13 +434,16 @@ export class ProcessSessionManager {
     session.running = false;
     session.exitCode = exitCode;
     session.signal = signal;
-    this.releaseActivity(session);
-    session.resolveExit();
-    session.cleanupTimer = setTimeout(
-      () => this.sessions.delete(session.id),
-      this.completedSessionTtlMs,
-    );
-    session.cleanupTimer.unref();
+    try {
+      this.releaseActivity(session);
+    } finally {
+      session.resolveExit();
+      session.cleanupTimer = setTimeout(
+        () => this.sessions.delete(session.id),
+        this.completedSessionTtlMs,
+      );
+      session.cleanupTimer.unref();
+    }
   }
 
   private append(session: ProcessSession, output: string): void {
@@ -481,7 +484,12 @@ export class ProcessSessionManager {
   private releaseActivity(session: ProcessSession): void {
     session.stopActivityHeartbeat?.();
     session.stopActivityHeartbeat = undefined;
-    session.activityLease?.release();
+    try {
+      session.activityLease?.release();
+    } catch {
+      // A custom or older lease implementation must not break process exit.
+      // Persisted leases remain fail-closed until their expiry.
+    }
     session.activityLease = undefined;
   }
 
