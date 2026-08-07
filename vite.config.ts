@@ -8,7 +8,7 @@ export default defineConfig({
   base: "./",
   build: {
     outDir: resolve(__dirname, "dist/ui"),
-    emptyOutDir: true,
+    emptyOutDir: process.env.DEVSPACE_VITE_WATCH !== "1",
     manifest: true,
     rollupOptions: {
       input: resolve(__dirname, "src/ui/workspace-app.html"),
