@@ -101,6 +101,68 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
   assert.equal(resolvedReadme.startsWith(opened.workspace.root), true);
 });
 
+test("Git workspaces discover only tracked and standard non-ignored nested instructions", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  await writeFile(join(gitRoot, ".gitignore"), "ignored-context/\n");
+  await mkdir(join(gitRoot, "tracked-context"));
+  await writeFile(join(gitRoot, "tracked-context", "AGENTS.md"), "tracked instructions\n");
+  await mkdir(join(gitRoot, "sibling-context"));
+  await writeFile(join(gitRoot, "sibling-context", "CLAUDE.md"), "sibling instructions\n");
+  await mkdir(join(gitRoot, "deleted-context"));
+  await writeFile(join(gitRoot, "deleted-context", "AGENTS.md"), "deleted instructions\n");
+  await git(gitRoot, ["add", ".gitignore", "tracked-context", "sibling-context", "deleted-context"]);
+  await git(gitRoot, ["commit", "-m", "Add nested instructions"]);
+  await rm(join(gitRoot, "deleted-context", "AGENTS.md"));
+
+  await mkdir(join(gitRoot, "untracked-context"));
+  await writeFile(join(gitRoot, "untracked-context", "CLAUDE.md"), "untracked instructions\n");
+  await mkdir(join(gitRoot, "ignored-context"));
+  await writeFile(join(gitRoot, "ignored-context", "AGENTS.md"), "ignored instructions\n");
+
+  const nestedRepository = join(gitRoot, "nested-repository");
+  await mkdir(nestedRepository);
+  await git(nestedRepository, ["init"]);
+  await git(nestedRepository, ["config", "user.email", "devspace@example.com"]);
+  await git(nestedRepository, ["config", "user.name", "DevSpace Test"]);
+  await writeFile(join(nestedRepository, "AGENTS.md"), "nested repository instructions\n");
+  await git(nestedRepository, ["add", "AGENTS.md"]);
+  await git(nestedRepository, ["commit", "-m", "Initial commit"]);
+
+  if (platform() !== "win32") {
+    await mkdir(join(gitRoot, "symlink-context"));
+    await writeFile(join(context.outsideRoot, "AGENTS.md"), "outside instructions\n");
+    await symlink(
+      join(context.outsideRoot, "AGENTS.md"),
+      join(gitRoot, "symlink-context", "AGENTS.md"),
+    );
+    await git(gitRoot, ["add", "symlink-context/AGENTS.md"]);
+  }
+
+  const opened = await context.registry.openWorkspace(gitRoot);
+  assert.deepEqual(
+    opened.availableAgentsFiles.map((file) => file.path),
+    [
+      join(gitRoot, "sibling-context", "CLAUDE.md"),
+      join(gitRoot, "tracked-context", "AGENTS.md"),
+      join(gitRoot, "untracked-context", "CLAUDE.md"),
+    ],
+  );
+
+  const subdirectory = await context.registry.openWorkspace(join(gitRoot, "tracked-context"));
+  assert.deepEqual(
+    subdirectory.agentsFiles.map((file) => file.content),
+    ["global instructions\n", "tracked instructions\n"],
+  );
+  assert.deepEqual(subdirectory.availableAgentsFiles, []);
+
+  const nested = await context.registry.openWorkspace(nestedRepository);
+  assert.deepEqual(
+    nested.agentsFiles.map((file) => file.content),
+    ["global instructions\n", "nested repository instructions\n"],
+  );
+});
+
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);

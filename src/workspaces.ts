@@ -7,10 +7,11 @@ import type {
   WorkspaceStatus,
   WorkspaceStore,
 } from "./workspace-store.js";
-import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
+import { git } from "./git.js";
 import {
   createManagedWorktree,
   inspectManagedWorktree,
@@ -619,6 +620,67 @@ export class WorkspaceRegistry {
       const realPath = await tryRealpath(file.path);
       if (realPath) loadedRealPaths.add(realPath);
     }
+
+    if (await isGitWorkspace(root)) {
+      return this.findAvailableAgentsFilesFromGit(root, loadedPaths, loadedRealPaths);
+    }
+
+    return this.findAvailableAgentsFilesByWalking(root, loadedPaths, loadedRealPaths);
+  }
+
+  private async findAvailableAgentsFilesFromGit(
+    root: string,
+    loadedPaths: Set<string>,
+    loadedRealPaths: Set<string>,
+  ): Promise<AvailableAgentsFile[]> {
+    const output = (
+      await git(root, [
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--no-directory",
+        "--",
+        ...CONTEXT_FILE_PATHS,
+      ])
+    ).stdout;
+    const resolvedRoot = (await tryRealpath(root)) ?? root;
+    const candidates = await Promise.all(
+      output
+        .split("\0")
+        .filter(Boolean)
+        .map(async (relativePath): Promise<{ path: string; realPath: string } | undefined> => {
+          const path = resolve(root, relativePath);
+          const pathStats = await tryLstat(path);
+          if (!pathStats?.isFile()) return undefined;
+
+          const realPath = await tryRealpath(path);
+          if (!realPath || !isPathInsideRoot(realPath, resolvedRoot)) return undefined;
+          return { path, realPath };
+        }),
+    );
+    const discoveredPaths = new Set<string>();
+    const discovered: AvailableAgentsFile[] = [];
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (loadedPaths.has(candidate.path)) continue;
+      if (loadedRealPaths.has(candidate.realPath)) continue;
+      if (discoveredPaths.has(candidate.path)) continue;
+
+      discovered.push({ path: candidate.path });
+      discoveredPaths.add(candidate.path);
+    }
+
+    return discovered.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  private async findAvailableAgentsFilesByWalking(
+    root: string,
+    loadedPaths: Set<string>,
+    loadedRealPaths: Set<string>,
+  ): Promise<AvailableAgentsFile[]> {
     const discovered: AvailableAgentsFile[] = [];
 
     await walkWorkspace(root, async (path, entry) => {
@@ -695,6 +757,7 @@ export async function ensureCheckoutWorkspaceRoot(
 }
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
+const CONTEXT_FILE_PATHS = Array.from(CONTEXT_FILE_NAMES, (name) => `:(glob)**/${name}`);
 const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",
@@ -749,6 +812,23 @@ async function tryRealpath(path: string): Promise<string | undefined> {
     return await realpath(path);
   } catch {
     return undefined;
+  }
+}
+
+async function tryLstat(path: string): Promise<Stats | undefined> {
+  try {
+    return await lstat(path);
+  } catch {
+    return undefined;
+  }
+}
+
+async function isGitWorkspace(path: string): Promise<boolean> {
+  try {
+    await git(path, ["rev-parse", "--show-toplevel"]);
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -118,6 +118,11 @@ When a workspace opens, DevSpace loads root-level instruction files:
 Nested instruction files are returned as `availableAgentsFiles`. The model
 should read the relevant nested file before working under that directory.
 
+For Git workspaces, DevSpace discovers nested instruction files from Git's
+tracked and standard non-ignored file set. Ignored generated trees and embedded
+Git repositories are not recursively searched as part of the parent workspace.
+Open an embedded repository separately when its instructions are needed.
+
 This keeps instructions explicit and inspectable instead of silently injecting
 new context during later tool calls.
 
