@@ -98,9 +98,36 @@ try {
     path: gitRoot,
     mode: "worktree",
   });
+  const missingCheckoutRoot = join(root, "missing-restored-checkout");
+  await mkdir(missingCheckoutRoot);
+  const missingRestoredCheckout = await firstRegistry.openWorkspace(missingCheckoutRoot, {
+    conversationScopeId: "conversation-missing-restore",
+  });
+  const missingRestoredWorktree = await firstRegistry.openWorkspace({
+    path: gitRoot,
+    mode: "worktree",
+  });
+  const unregisteredRestoredWorktree = await firstRegistry.openWorkspace({
+    path: gitRoot,
+    mode: "worktree",
+  });
   firstRegistry.detachAll();
   assert.equal(firstStore.getSession(restoredCheckout.workspace.id)?.status, "detached");
   assert.equal(firstStore.getSession(restoredWorktree.workspace.id)?.status, "detached");
+  await rm(missingCheckoutRoot, { recursive: true, force: true });
+  await git(gitRoot, [
+    "worktree",
+    "remove",
+    "--force",
+    missingRestoredWorktree.workspace.root,
+  ]);
+  await git(gitRoot, [
+    "worktree",
+    "remove",
+    "--force",
+    unregisteredRestoredWorktree.workspace.root,
+  ]);
+  await mkdir(unregisteredRestoredWorktree.workspace.root);
   firstStore.close();
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
@@ -112,6 +139,30 @@ try {
     restoredWorktree.workspace.root,
   );
   assert.equal(secondStore.getSession(restoredWorktree.workspace.id)?.status, "open");
+  assert.throws(
+    () => secondRegistry.getWorkspace(missingRestoredCheckout.workspace.id),
+    /orphaned/,
+  );
+  assert.equal(
+    secondStore.getSession(missingRestoredCheckout.workspace.id)?.status,
+    "orphaned",
+  );
+  assert.throws(
+    () => secondRegistry.getWorkspace(missingRestoredWorktree.workspace.id),
+    /orphaned/,
+  );
+  assert.equal(
+    secondStore.getSession(missingRestoredWorktree.workspace.id)?.status,
+    "orphaned",
+  );
+  assert.throws(
+    () => secondRegistry.getWorkspace(unregisteredRestoredWorktree.workspace.id),
+    /cleanup_failed/,
+  );
+  assert.equal(
+    secondStore.getSession(unregisteredRestoredWorktree.workspace.id)?.status,
+    "cleanup_failed",
+  );
   secondRegistry.detachAll();
   secondStore.close();
 } finally {
