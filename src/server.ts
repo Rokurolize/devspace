@@ -50,7 +50,7 @@ import {
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { openAiConversationScopeId } from "./request-meta.js";
+import { correlationHash, openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -63,10 +63,14 @@ import {
 } from "./local-agent-availability.js";
 
 type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+interface McpSessionContext {
+  sessionIdPrefix?: string;
+}
+// MCP clients can reconnect without closing the previous transport. Keep abandoned
+// transports short-lived and bounded independently from workspace persistence.
+const MCP_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const MCP_SESSION_MAX_COUNT = 256;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -166,6 +170,7 @@ function toolWidgetDescriptorMeta(
 
 const toolNames = {
   openWorkspace: "open_workspace",
+  closeWorkspace: "close_workspace",
   read: "read",
   write: "write",
   edit: "edit",
@@ -178,6 +183,10 @@ const toolNames = {
 interface ToolLogFields {
   tool: string;
   workspaceId?: string;
+  workspaceReused?: boolean;
+  mcpSessionIdPrefix?: string;
+  conversationScopeIdPrefix?: string;
+  workspaceTargetKeyHashPrefix?: string;
   path?: string;
   workingDirectory?: string;
   command?: string;
@@ -195,9 +204,10 @@ function serverInstructions(config: ServerConfig): string {
     config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
+  const closeInstruction = ` Do not treat MCP disconnects or the end of a turn as workspace closure. Call ${toolNames.closeWorkspace} only when the user explicitly asks to release a workspace or managed worktree.`;
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -210,7 +220,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -701,6 +711,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  mcpSessionContext: McpSessionContext = {},
 ): McpServer {
   const server = new McpServer(
     {
@@ -798,6 +809,7 @@ export function createMcpServer(
     },
     async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
+      const conversationScopeId = openAiConversationScopeId(_meta);
       const {
         workspace,
         agentsFiles,
@@ -806,7 +818,7 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId },
       );
       if (config.widgets === "changes") {
         await reviewCheckpoints.initializeWorkspace({
@@ -891,6 +903,17 @@ export function createMcpServer(
       logToolCall(config, {
         tool: "open_workspace",
         workspaceId: workspace.id,
+        workspaceReused,
+        mcpSessionIdPrefix: mcpSessionContext.sessionIdPrefix,
+        conversationScopeIdPrefix: conversationScopeId?.slice(0, 12),
+        workspaceTargetKeyHashPrefix: correlationHash(
+          "workspace-target",
+          JSON.stringify([
+            workspace.mode,
+            workspace.mode === "checkout" ? workspace.root : workspace.sourceRoot,
+            workspace.mode === "worktree" ? workspace.worktree?.baseRef ?? "HEAD" : null,
+          ]),
+        ).slice(0, 12),
         path: workspace.root,
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
@@ -942,6 +965,93 @@ export function createMcpServer(
               }
             : {}),
           instruction,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    toolNames.closeWorkspace,
+    {
+      title: "Close workspace",
+      description:
+        "Explicitly close an open workspace. Checkout mode only closes the persisted handle and never deletes the user's checkout. Managed worktree mode removes the Git worktree only when no DevSpace process is running for the workspace and the worktree is clean. Set discardChanges=true only when the user explicitly asks to discard dirty managed-worktree changes. MCP disconnects do not call this tool automatically.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        discardChanges: z
+          .boolean()
+          .optional()
+          .describe(
+            "Managed worktrees only. Explicitly discard uncommitted changes while removing the worktree. Defaults to false.",
+          ),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        root: z.string(),
+        mode: z.enum(["checkout", "worktree"]),
+        status: z.enum(["closed", "orphaned", "cleanup_failed"]),
+        removedWorktree: z.boolean(),
+        reason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId, discardChanges }) => {
+      const startedAt = performance.now();
+      try {
+        processSessions.beginWorkspaceClose(workspaceId);
+      } catch (cause) {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        logToolCall(config, {
+          tool: toolNames.closeWorkspace,
+          workspaceId,
+          success: false,
+          durationMs: Math.round(performance.now() - startedAt),
+          error,
+        });
+        throw new Error(error);
+      }
+
+      let result;
+      try {
+        result = await workspaces.closeWorkspace(workspaceId, { discardChanges });
+      } finally {
+        processSessions.endWorkspaceClose(workspaceId);
+      }
+      logToolCall(config, {
+        tool: toolNames.closeWorkspace,
+        workspaceId,
+        path: result.root,
+        success: result.status !== "cleanup_failed",
+        durationMs: Math.round(performance.now() - startedAt),
+        error: result.status === "cleanup_failed" ? result.reason : undefined,
+      });
+
+      const text = [
+        `Workspace ${result.workspaceId}: ${result.status}`,
+        `Root: ${result.root}`,
+        `Mode: ${result.mode}`,
+        `Removed managed worktree: ${result.removedWorktree ? "yes" : "no"}`,
+        result.reason ? `Reason: ${result.reason}` : undefined,
+      ].filter(Boolean).join("\n");
+
+      return {
+        content: [{ type: "text" as const, text }],
+        structuredContent: {
+          workspaceId: result.workspaceId,
+          root: result.root,
+          mode: result.mode,
+          status: result.status,
+          removedWorktree: result.removedWorktree,
+          reason: result.reason,
         },
       };
     },
@@ -1588,15 +1698,21 @@ export function createMcpServer(
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const cwd = workspaces.resolveWorkingDirectory(
-        workspace,
-        workingDirectory,
-      );
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-      });
+      processSessions.beginShellCommand(workspaceId);
+      let response;
+      try {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const cwd = workspaces.resolveWorkingDirectory(
+          workspace,
+          workingDirectory,
+        );
+        response = await runShellTool(input, {
+          cwd,
+          root: workspace.root,
+        });
+      } finally {
+        processSessions.endShellCommand(workspaceId);
+      }
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1675,7 +1791,9 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>({
+    maxSessions: MCP_SESSION_MAX_COUNT,
+  });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -1685,6 +1803,7 @@ export function createServer(
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  workspaceStore.detachOpenSessions();
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
@@ -1693,7 +1812,7 @@ export function createServer(
     : [];
 
   const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
+    reason: "idle_timeout" | "session_limit" | "server_shutdown",
     results: McpSessionCloseResult[],
   ) => {
     for (const result of results) {
@@ -1701,6 +1820,7 @@ export function createServer(
         logEvent(config.logging, "warn", "mcp_session_close_failed", {
           reason,
           sessionIdPrefix: sessionIdPrefix(result.sessionId),
+          registrySize: transports.size,
           error:
             result.error instanceof Error
               ? result.error.message
@@ -1712,6 +1832,7 @@ export function createServer(
       logEvent(config.logging, "info", "mcp_session_closed", {
         reason,
         sessionIdPrefix: sessionIdPrefix(result.sessionId),
+        registrySize: transports.size,
       });
     }
   };
@@ -1811,6 +1932,8 @@ export function createServer(
       sessionIdPresent: Boolean(sessionId),
       sessionIdPrefix: sessionIdPrefix(sessionId),
       isInitialize: initializeRequest,
+      registrySize: transports.size,
+      registryLimit: MCP_SESSION_MAX_COUNT,
     });
 
     try {
@@ -1823,13 +1946,20 @@ export function createServer(
           return;
         }
       } else if (initializeRequest) {
+        const mcpSessionContext: McpSessionContext = {};
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
+          onsessioninitialized: async (newSessionId) => {
+            mcpSessionContext.sessionIdPrefix = sessionIdPrefix(newSessionId);
+            if (transport) {
+              const results = await transports.register(newSessionId, transport);
+              logSessionCloseResults("session_limit", results);
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
+              registrySize: transports.size,
+              registryLimit: MCP_SESSION_MAX_COUNT,
               ...requestLogFields(req, config),
             });
           },
@@ -1841,6 +1971,7 @@ export function createServer(
             logEvent(config.logging, "info", "mcp_session_closed", {
               reason: "transport_close",
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
+              registrySize: transports.size,
             });
           }
         };
@@ -1852,6 +1983,7 @@ export function createServer(
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
+          mcpSessionContext,
         );
         await server.connect(transport);
       } else {
@@ -1882,6 +2014,7 @@ export function createServer(
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        workspaces.detachAll();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

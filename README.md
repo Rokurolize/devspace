@@ -137,6 +137,7 @@ DevSpace gives ChatGPT tools to:
 - search code and inspect directories
 - run shell commands for tests, builds, git, and package scripts
 - use isolated Git worktrees for parallel coding sessions
+- explicitly close workspace handles and safely reconcile stale managed worktrees
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts

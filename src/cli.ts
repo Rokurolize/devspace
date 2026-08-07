@@ -39,8 +39,22 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import {
+  applyWorkspaceReconcile,
+  inspectWorkspaceSessions,
+  type WorkspaceReconcileEntry,
+} from "./workspace-reconcile.js";
+import { createWorkspaceStore } from "./workspace-store.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command =
+  | "serve"
+  | "init"
+  | "doctor"
+  | "config"
+  | "agents"
+  | "workspaces"
+  | "help"
+  | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -67,6 +81,9 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       await runAgentsCommand(args);
       return;
+    case "workspaces":
+      await runWorkspacesCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -78,7 +95,13 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (
+    command === "init" ||
+    command === "doctor" ||
+    command === "config" ||
+    command === "agents" ||
+    command === "workspaces"
+  ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -297,6 +320,103 @@ function runConfigCommand(args: string[]): void {
   console.log(`Updated ${files.configPath}`);
 }
 
+async function runWorkspacesCommand(args: string[]): Promise<void> {
+  const [subcommand, ...rest] = args;
+  switch (subcommand) {
+    case "prune":
+      await runWorkspacesPrune(rest);
+      return;
+    case undefined:
+    case "help":
+    case "--help":
+    case "-h":
+      printWorkspacesHelp();
+      return;
+    default:
+      throw new Error(`Unknown workspaces command: ${subcommand}`);
+  }
+}
+
+async function runWorkspacesPrune(args: string[]): Promise<void> {
+  const apply = args.includes("--apply");
+  const workspaceIds = args.filter((arg) => arg !== "--apply");
+  if (!apply && workspaceIds.length > 0) {
+    throw new Error("Workspace IDs are accepted only with --apply.");
+  }
+  if (apply && workspaceIds.length === 0) {
+    throw new Error(
+      "Applying workspace cleanup requires one or more workspace IDs from a prior dry-run.",
+    );
+  }
+
+  const config = loadConfig();
+  const store = createWorkspaceStore(config.stateDir);
+  try {
+    const report = await inspectWorkspaceSessions(config, store);
+    const candidates = report.filter((entry) => entry.action !== "none");
+
+    if (!apply) {
+      console.log("Workspace prune dry-run; no workspace cleanup actions were applied.");
+      if (candidates.length === 0) {
+        console.log("No workspace cleanup candidates.");
+        return;
+      }
+      for (const entry of candidates) console.log(formatWorkspaceReconcileEntry(entry));
+      console.log(`${candidates.length} candidate(s); ${report.length} persisted workspace row(s).`);
+      console.log(
+        "Apply selected candidates with: devspace workspaces prune --apply <workspace-id>...",
+      );
+      return;
+    }
+
+    const byId = new Map(report.map((entry) => [entry.workspaceId, entry]));
+    const unknownIds = workspaceIds.filter((workspaceId) => !byId.has(workspaceId));
+    if (unknownIds.length > 0) {
+      throw new Error(`Unknown workspace ID(s): ${unknownIds.join(", ")}`);
+    }
+    const selected = workspaceIds.map((workspaceId) => byId.get(workspaceId)!);
+    const nonCandidates = selected.filter((entry) => entry.action === "none");
+    if (nonCandidates.length > 0) {
+      throw new Error(
+        `Workspace ID(s) are not cleanup candidates: ${nonCandidates.map((entry) => entry.workspaceId).join(", ")}`,
+      );
+    }
+
+    await applyWorkspaceReconcile(config, store, workspaceIds);
+    console.log("Applied workspace cleanup to the explicitly selected candidates:");
+    for (const entry of selected) console.log(formatWorkspaceReconcileEntry(entry));
+    console.log("Closed and orphaned workspace history remains in the database; no automatic compaction was performed.");
+  } finally {
+    store.close?.();
+  }
+}
+
+function formatWorkspaceReconcileEntry(entry: WorkspaceReconcileEntry): string {
+  const details = [
+    entry.pathExists === undefined ? undefined : `pathExists=${entry.pathExists}`,
+    entry.registered === undefined ? undefined : `registered=${entry.registered}`,
+    entry.dirty === undefined ? undefined : `dirty=${entry.dirty}`,
+    `conversationBound=${entry.conversationBound}`,
+    `lastUsedAt=${entry.lastUsedAt}`,
+  ].filter(Boolean).join(" ");
+  return `${entry.workspaceId} ${entry.action} ${entry.mode} ${entry.status} ${entry.root}\n  ${details}\n  ${entry.reason}`;
+}
+
+function printWorkspacesHelp(): void {
+  console.log(
+    [
+      "DevSpace workspaces",
+      "",
+      "Usage:",
+      "  devspace workspaces prune",
+      "  devspace workspaces prune --apply <workspace-id>...",
+      "",
+      "The first form is always a dry-run. Apply requires explicit workspace IDs from that dry-run.",
+      "User checkouts, dirty worktrees, Git-unregistered directories, and directories absent from the database are never deleted.",
+    ].join("\n"),
+  );
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -312,6 +432,7 @@ function printHelp(): void {
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",
+      "  devspace workspaces prune [--apply <workspace-id>...]",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

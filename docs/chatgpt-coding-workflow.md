@@ -89,6 +89,23 @@ Uncommitted source checkout changes are not copied into the managed worktree.
 DevSpace reports when the source checkout was dirty so the model can decide how
 to proceed with the user.
 
+## Close a Workspace
+
+MCP transport closure and workspace closure are separate lifecycles. A client
+reconnect, an MCP idle eviction, or the end of a turn does not close a workspace.
+
+Use `close_workspace` only when the user explicitly asks to release a workspace
+or managed worktree. Closing checkout mode marks the workspace handle closed but
+never removes the user's checkout directory. Closing a managed worktree checks
+for running DevSpace processes, verifies the Git registration, and refuses to
+remove dirty worktrees by default. `discardChanges=true` is an explicit opt-in
+for discarding a dirty managed worktree.
+
+DevSpace records workspace lifecycle as `detached`, `open`, `closed`,
+`orphaned`, or `cleanup_failed`. A clean shutdown detaches open workspaces so
+they can be restored after restart. Missing paths become orphaned; unsafe or
+failed cleanup remains inspectable as cleanup failed.
+
 ## Project Instructions
 
 When a workspace opens, DevSpace loads root-level instruction files:
@@ -152,6 +169,7 @@ existing subagent sessions for that workspace.
 DevSpace exposes these tool names:
 
 - `open_workspace`
+- `close_workspace`
 - `read`
 - `write`
 - `edit`
@@ -167,6 +185,7 @@ The experimental Codex-style surface is enabled with
 `DEVSPACE_TOOL_MODE=codex`. It exposes:
 
 - `open_workspace`
+- `close_workspace`
 - `read`
 - `apply_patch`
 - `exec_command`

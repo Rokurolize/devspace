@@ -84,3 +84,27 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+
+const boundedRegistry = new McpSessionRegistry<FakeTransport>({
+  now: () => now,
+  maxSessions: 2,
+});
+const oldest = createTransport();
+const newer = createTransport();
+const newest = createTransport();
+await boundedRegistry.register("oldest", oldest);
+now += 1;
+await boundedRegistry.register("newer", newer);
+now += 1;
+const capacityResults = await boundedRegistry.register("newest", newest);
+assert.deepEqual(capacityResults, [{ sessionId: "oldest" }]);
+assert.equal(oldest.closeCalls, 1);
+assert.equal(boundedRegistry.size, 2);
+assert.equal(boundedRegistry.get("oldest"), undefined);
+assert.equal(boundedRegistry.get("newer"), newer);
+assert.equal(boundedRegistry.get("newest"), newest);
+
+assert.throws(
+  () => new McpSessionRegistry<FakeTransport>({ maxSessions: 0 }),
+  /maxSessions must be a positive integer/,
+);

@@ -3,13 +3,19 @@ import type { Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
+  WorkspaceSession,
+  WorkspaceStatus,
   WorkspaceStore,
 } from "./workspace-store.js";
 import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import {
+  createManagedWorktree,
+  inspectManagedWorktree,
+  removeManagedWorktree,
+} from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -80,6 +86,19 @@ export interface OpenWorkspaceInput {
 
 export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
+}
+
+export interface CloseWorkspaceOptions {
+  discardChanges?: boolean;
+}
+
+export interface CloseWorkspaceResult {
+  workspaceId: string;
+  root: string;
+  mode: WorkspaceMode;
+  status: Extract<WorkspaceStatus, "closed" | "orphaned" | "cleanup_failed">;
+  removedWorktree: boolean;
+  reason?: string;
 }
 
 type PathStats = Stats;
@@ -194,7 +213,12 @@ export class WorkspaceRegistry {
     binding: WorkspaceConversationBinding,
   ): Promise<Workspace | undefined> {
     const session = this.store?.getSession(binding.workspaceSessionId);
-    if (!session || session.status !== "active" || session.mode !== "checkout") {
+    if (
+      !session ||
+      session.mode !== "checkout" ||
+      session.status === "closed" ||
+      session.status === "orphaned"
+    ) {
       return undefined;
     }
 
@@ -202,12 +226,26 @@ export class WorkspaceRegistry {
     try {
       root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
       const rootStats = await stat(root);
-      if (!rootStats.isDirectory()) return undefined;
+      if (!rootStats.isDirectory()) {
+        this.store?.setSessionStatus(
+          session.id,
+          "orphaned",
+          "Workspace path no longer exists or is not a directory.",
+        );
+        return undefined;
+      }
     } catch (error) {
       if (
         error instanceof AccessDeniedError ||
         (isErrnoException(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
       ) {
+        this.store?.setSessionStatus(
+          session.id,
+          error instanceof AccessDeniedError ? "cleanup_failed" : "orphaned",
+          error instanceof AccessDeniedError
+            ? `Workspace path is no longer inside an allowed root: ${session.root}`
+            : "Workspace path no longer exists or is not a directory.",
+        );
         return undefined;
       }
 
@@ -242,16 +280,150 @@ export class WorkspaceRegistry {
     };
   }
 
+  async closeWorkspace(
+    workspaceId: string,
+    options: CloseWorkspaceOptions = {},
+  ): Promise<CloseWorkspaceResult> {
+    const workspace = this.workspaces.get(workspaceId);
+    const session = this.store?.getSession(workspaceId) ?? workspaceSessionFromWorkspace(workspace);
+    if (!session) {
+      throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
+    }
+
+    if (session.status === "closed" || session.status === "orphaned") {
+      return {
+        workspaceId,
+        root: session.root,
+        mode: session.mode,
+        status: session.status,
+        removedWorktree: false,
+        reason: session.statusReason,
+      };
+    }
+
+    if (session.mode === "checkout" || !session.managed) {
+      return this.finishWorkspaceClose(session, "closed", false);
+    }
+
+    if (!session.sourceRoot) {
+      return this.finishWorkspaceClose(
+        session,
+        "cleanup_failed",
+        false,
+        "Managed worktree is missing its source checkout path.",
+      );
+    }
+
+    let inspection;
+    try {
+      inspection = await inspectManagedWorktree({
+        sourceRoot: session.sourceRoot,
+        worktreePath: session.root,
+        config: this.config,
+      });
+    } catch (error) {
+      return this.finishWorkspaceClose(
+        session,
+        "cleanup_failed",
+        false,
+        `Could not inspect managed worktree: ${errorMessage(error)}`,
+      );
+    }
+
+    if (!inspection.pathExists) {
+      return this.finishWorkspaceClose(
+        session,
+        "orphaned",
+        false,
+        "Managed worktree path no longer exists.",
+      );
+    }
+    if (!inspection.registered) {
+      return this.finishWorkspaceClose(
+        session,
+        "cleanup_failed",
+        false,
+        "Managed worktree path exists but is not registered with Git.",
+      );
+    }
+    if (inspection.dirty && !options.discardChanges) {
+      return this.finishWorkspaceClose(
+        session,
+        "cleanup_failed",
+        false,
+        "Managed worktree has uncommitted changes. Commit or remove them, then close again; use discardChanges only to explicitly discard them.",
+      );
+    }
+
+    try {
+      await removeManagedWorktree({
+        sourceRoot: session.sourceRoot,
+        worktreePath: session.root,
+        discardChanges: options.discardChanges,
+        config: this.config,
+      });
+    } catch (error) {
+      return this.finishWorkspaceClose(
+        session,
+        "cleanup_failed",
+        false,
+        `Git could not remove managed worktree: ${errorMessage(error)}`,
+      );
+    }
+
+    return this.finishWorkspaceClose(session, "closed", true);
+  }
+
+  detachAll(): void {
+    this.store?.detachOpenSessions();
+    this.workspaces.clear();
+  }
+
+  private finishWorkspaceClose(
+    session: WorkspaceSession,
+    status: CloseWorkspaceResult["status"],
+    removedWorktree: boolean,
+    reason?: string,
+  ): CloseWorkspaceResult {
+    this.store?.setSessionStatus(session.id, status, reason);
+    if (status === "closed" || status === "orphaned") {
+      this.store?.deleteConversationBindingsForSession(session.id);
+      this.workspaces.delete(session.id);
+    }
+
+    return {
+      workspaceId: session.id,
+      root: session.root,
+      mode: session.mode,
+      status,
+      removedWorktree,
+      reason,
+    };
+  }
+
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
-      this.store?.touchSession(workspaceId);
+      const session = this.store?.getSession(workspaceId);
+      if (session?.status === "closed" || session?.status === "orphaned") {
+        const reason = session.statusReason ? ` ${session.statusReason}` : "";
+        throw new Error(`Workspace ${workspaceId} is ${session.status}.${reason}`);
+      }
+      if (session?.status === "detached" || session?.status === "cleanup_failed") {
+        this.store?.setSessionStatus(workspaceId, "open");
+      } else {
+        this.store?.touchSession(workspaceId);
+      }
       return workspace;
     }
 
     const session = this.store?.getSession(workspaceId);
     if (!session) {
       throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
+    }
+    if (session.status === "closed" || session.status === "orphaned") {
+      const reason = session.statusReason ? ` ${session.statusReason}` : "";
+      throw new Error(`Workspace ${workspaceId} is ${session.status}.${reason}`);
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
@@ -275,7 +447,11 @@ export class WorkspaceRegistry {
       agentProfiles: [],
       activatedSkillDirs: new Set(),
     };
-    this.store?.touchSession(workspaceId);
+    if (session.status === "detached" || session.status === "cleanup_failed") {
+      this.store?.setSessionStatus(workspaceId, "open");
+    } else {
+      this.store?.touchSession(workspaceId);
+    }
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
@@ -457,6 +633,29 @@ export class WorkspaceRegistry {
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
   }
+}
+
+function workspaceSessionFromWorkspace(
+  workspace: Workspace | undefined,
+): WorkspaceSession | undefined {
+  if (!workspace) return undefined;
+  const now = new Date().toISOString();
+  return {
+    id: workspace.id,
+    root: workspace.root,
+    status: "open",
+    mode: workspace.mode,
+    sourceRoot: workspace.sourceRoot,
+    baseRef: workspace.worktree?.baseRef,
+    baseSha: workspace.worktree?.baseSha,
+    managed: workspace.worktree?.managed ?? false,
+    createdAt: now,
+    lastUsedAt: now,
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function canonicalPath(path: string): Promise<string> {
