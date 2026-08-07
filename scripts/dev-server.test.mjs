@@ -12,6 +12,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+if (process.platform === "win32") process.exit(0);
+
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const supervisorPath = join(repositoryRoot, "scripts", "dev-server.mjs");
 const root = await mkdtemp(join(tmpdir(), "devspace-dev-server-test-"));

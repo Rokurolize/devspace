@@ -516,7 +516,15 @@ async function runAgentsRun(args: string[]): Promise<void> {
       latestResponse: undefined,
       error: undefined,
     });
-    spawnAgentWorkerWithActivity(config, existing, promptFile);
+    try {
+      spawnAgentWorkerWithActivity(config, existing, promptFile);
+    } catch (error) {
+      store.update(existing.id, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     console.log(formatAgentLine({
       ...existing,
       status: "running",
@@ -545,7 +553,15 @@ async function runAgentsRun(args: string[]): Promise<void> {
     thinking: target.thinking,
   });
 
-  spawnAgentWorkerWithActivity(config, record, promptFile);
+  try {
+    spawnAgentWorkerWithActivity(config, record, promptFile);
+  } catch (error) {
+    store.update(record.id, {
+      status: "error",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
   console.log(formatAgentLine({ ...record, status: "running" }));
 }
 
