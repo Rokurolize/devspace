@@ -28,6 +28,7 @@ let serverChild;
 let uiChild;
 let initialBuildChild;
 let restartTimer;
+let restartPromise;
 let restartingServer = false;
 let shuttingDown = false;
 const watchers = [];
@@ -88,6 +89,12 @@ async function runInitialUiBuild() {
 function startUiWatcher() {
   uiChild = spawnCommand(uiWatchCommand, { DEVSPACE_VITE_WATCH: "1" });
   const current = uiChild;
+  current.on("error", (error) => {
+    if (uiChild === current) uiChild = undefined;
+    if (shuttingDown) return;
+    log(`UI builder failed to start: ${error.message}`);
+    void shutdown(1);
+  });
   current.on("exit", (code, signal) => {
     if (uiChild === current) uiChild = undefined;
     if (shuttingDown) return;
@@ -100,6 +107,12 @@ function startServer() {
   restartingServer = false;
   serverChild = spawnCommand(serverCommand);
   const current = serverChild;
+  current.on("error", (error) => {
+    if (serverChild === current) serverChild = undefined;
+    if (shuttingDown || restartingServer) return;
+    log(`server failed to start: ${error.message}`);
+    void shutdown(1);
+  });
   current.on("exit", (code, signal) => {
     if (serverChild === current) serverChild = undefined;
     if (shuttingDown || restartingServer) return;
@@ -110,11 +123,20 @@ function startServer() {
 }
 
 function scheduleRestart(delayMs = restartDelayMs) {
+  if (restartPromise) return;
   clearTimeout(restartTimer);
   restartTimer = setTimeout(() => void restartServer(), delayMs);
 }
 
-async function restartServer() {
+function restartServer() {
+  if (restartPromise) return restartPromise;
+  restartPromise = performRestart().finally(() => {
+    restartPromise = undefined;
+  });
+  return restartPromise;
+}
+
+async function performRestart() {
   if (shuttingDown) return;
   clearTimeout(restartTimer);
 

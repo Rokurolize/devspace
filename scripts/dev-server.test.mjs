@@ -27,8 +27,12 @@ try {
       'appendFileSync(logPath, `start ${kind} ${process.pid}\\n`);',
       'if (exitCode !== undefined) process.exit(Number(exitCode));',
       'const stop = () => {',
-      '  appendFileSync(logPath, `stop ${kind} ${process.pid}\\n`);',
-      '  process.exit(0);',
+      '  appendFileSync(logPath, `signal ${kind} ${process.pid}\\n`);',
+      '  const delay = kind === "server" ? Number(process.env.FAKE_SERVER_STOP_DELAY_MS ?? 0) : 0;',
+      '  setTimeout(() => {',
+      '    appendFileSync(logPath, `stop ${kind} ${process.pid}\\n`);',
+      '    process.exit(0);',
+      '  }, delay);',
       '};',
       'process.on("SIGINT", stop);',
       'process.on("SIGTERM", stop);',
@@ -38,6 +42,8 @@ try {
     ].join("\n"),
   );
   await testUiAndBackendWatches(join(root, "watching"));
+  await testOverlappingBackendRestarts(join(root, "restart-overlap"));
+  await testSpawnFailuresCleanUpChildren(join(root, "spawn-failures"));
   await testShutdownDuringInitialBuild(join(root, "initial-shutdown"));
   await testInitialBuildFailure(join(root, "initial-failure"));
 } finally {
@@ -86,6 +92,54 @@ async function testInitialBuildFailure(testRoot) {
   assert.equal(hasStarts(lines, "server", 1), false);
 }
 
+async function testOverlappingBackendRestarts(testRoot) {
+  const logPath = join(testRoot, "children.log");
+  await mkdir(join(testRoot, "src", "ui"), { recursive: true });
+  await writeFile(join(testRoot, "src", "backend.ts"), "export {};\n");
+  const supervisor = startSupervisor(testRoot, logPath, 0, {
+    FAKE_SERVER_STOP_DELAY_MS: "1500",
+  });
+  try {
+    await waitForLog(logPath, (lines) => hasStarts(lines, "server", 1));
+    const firstServerPid = startedPids(await logLines(logPath), "server")[0];
+    await appendFile(join(testRoot, "src", "backend.ts"), "// first change\n");
+    await waitForLog(
+      logPath,
+      (lines) => lines.includes(`signal server ${firstServerPid}`),
+    );
+    await appendFile(join(testRoot, "src", "backend.ts"), "// overlapping change\n");
+    await waitForLog(logPath, (lines) => hasStarts(lines, "server", 2));
+    await delay(1200);
+    assert.equal(startedPids(await logLines(logPath), "server").length, 2);
+  } finally {
+    supervisor.kill("SIGTERM");
+  }
+  assert.equal((await waitForExit(supervisor)).code, 0);
+}
+
+async function testSpawnFailuresCleanUpChildren(testRoot) {
+  const serverFailureRoot = join(testRoot, "server");
+  const serverLog = join(serverFailureRoot, "children.log");
+  await mkdir(join(serverFailureRoot, "src", "ui"), { recursive: true });
+  const serverFailure = startSupervisor(serverFailureRoot, serverLog, 0, {}, {
+    server: [join(serverFailureRoot, "missing-server")],
+  });
+  const serverResult = await waitForExit(serverFailure);
+  assert.notEqual(serverResult.code, 0);
+  await assertStartedProcessesExited(await logLines(serverLog), "ui-watch");
+
+  const uiFailureRoot = join(testRoot, "ui");
+  const uiLog = join(uiFailureRoot, "children.log");
+  await mkdir(join(uiFailureRoot, "src", "ui"), { recursive: true });
+  const uiFailure = startSupervisor(uiFailureRoot, uiLog, 0, {}, {
+    ui: [join(uiFailureRoot, "missing-ui-builder")],
+  });
+  const uiResult = await waitForExit(uiFailure);
+  assert.notEqual(uiResult.code, 0);
+  const uiLines = await logLines(uiLog);
+  await assertStartedProcessesExited(uiLines, "server");
+}
+
 async function testShutdownDuringInitialBuild(testRoot) {
   const logPath = join(testRoot, "children.log");
   await mkdir(join(testRoot, "src", "ui"), { recursive: true });
@@ -101,7 +155,13 @@ async function testShutdownDuringInitialBuild(testRoot) {
   assert.equal(hasStarts(lines, "server", 1), false);
 }
 
-function startSupervisor(testRoot, logPath, initialExitCode) {
+function startSupervisor(
+  testRoot,
+  logPath,
+  initialExitCode,
+  extraEnv = {},
+  commandOverrides = {},
+) {
   const command = (kind, exitCode) => JSON.stringify([
     process.execPath,
     fixturePath,
@@ -113,10 +173,15 @@ function startSupervisor(testRoot, logPath, initialExitCode) {
     cwd: repositoryRoot,
     env: {
       ...process.env,
+      ...extraEnv,
       DEVSPACE_DEV_REPO_ROOT: testRoot,
       DEVSPACE_DEV_INITIAL_BUILD_COMMAND: command("initial", initialExitCode),
-      DEVSPACE_DEV_UI_WATCH_COMMAND: command("ui-watch"),
-      DEVSPACE_DEV_SERVER_COMMAND: command("server"),
+      DEVSPACE_DEV_UI_WATCH_COMMAND: commandOverrides.ui
+        ? JSON.stringify(commandOverrides.ui)
+        : command("ui-watch"),
+      DEVSPACE_DEV_SERVER_COMMAND: commandOverrides.server
+        ? JSON.stringify(commandOverrides.server)
+        : command("server"),
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -153,6 +218,24 @@ function hasStarts(lines, kind, count) {
 
 function hasStops(lines, kind) {
   return lines.some((line) => line.startsWith(`stop ${kind} `));
+}
+
+async function assertStartedProcessesExited(lines, kind) {
+  const deadline = Date.now() + 3_000;
+  for (const pid of startedPids(lines, kind)) {
+    while (processExists(pid) && Date.now() < deadline) await delay(25);
+    assert.equal(processExists(pid), false, `${kind} process ${pid} is still running`);
+  }
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
 }
 
 function waitForExit(child) {
