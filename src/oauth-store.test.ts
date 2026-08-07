@@ -21,12 +21,60 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
+  testLegacyWorkspaceLifecycleMigration(join(root, "workspace-lifecycle-migration"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+function testLegacyWorkspaceLifecycleMigration(stateDir: string): void {
+  const firstDatabase = openDatabase(stateDir);
+  try {
+    firstDatabase.sqlite.prepare(`
+      insert into workspace_sessions (
+        id,
+        root,
+        status,
+        mode,
+        managed,
+        created_at,
+        last_used_at
+      ) values (?, ?, 'active', 'checkout', 'false', ?, ?)
+    `).run(
+      "ws_legacy_active",
+      "/tmp/legacy-workspace",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+    );
+    firstDatabase.sqlite
+      .prepare("delete from devspace_schema_migrations where version = 5")
+      .run();
+  } finally {
+    firstDatabase.close();
+  }
+
+  const migratedDatabase = openDatabase(stateDir);
+  try {
+    assert.equal(
+      migratedDatabase.sqlite
+        .prepare("select status from workspace_sessions where id = ?")
+        .pluck()
+        .get("ws_legacy_active"),
+      "detached",
+    );
+    assert.equal(
+      migratedDatabase.sqlite
+        .prepare("select name from devspace_schema_migrations where version = 5")
+        .pluck()
+        .get(),
+      "workspace-lifecycle",
+    );
+  } finally {
+    migratedDatabase.close();
+  }
 }
 
 async function testDatabaseConfiguration(stateDir: string): Promise<void> {
@@ -45,6 +93,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 2, name: "oauth-state" },
       { version: 3, name: "local-agent-sessions" },
       { version: 4, name: "workspace-conversation-bindings" },
+      { version: 5, name: "workspace-lifecycle" },
     ]);
   } finally {
     database.close();

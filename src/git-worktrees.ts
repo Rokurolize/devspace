@@ -33,6 +33,12 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
+export interface ManagedWorktreeInspection {
+  pathExists: boolean;
+  registered: boolean;
+  dirty: boolean;
+}
+
 export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;
@@ -88,6 +94,42 @@ export async function createManagedWorktree(input: {
     detached: true,
     managed: true,
   };
+}
+
+export async function inspectManagedWorktree(input: {
+  sourceRoot: string;
+  worktreePath: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktreeInspection> {
+  const sourceRoot = assertAllowedPath(input.sourceRoot, input.config.allowedRoots);
+  const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
+  const pathExists = await directoryExists(worktreePath);
+  if (!pathExists) {
+    return { pathExists: false, registered: false, dirty: false };
+  }
+  const registeredPaths = parseWorktreePaths(
+    await git(["worktree", "list", "--porcelain", "-z"], sourceRoot),
+  );
+  const registered = registeredPaths.some((path) => resolve(path) === resolve(worktreePath));
+  const dirty = pathExists && registered
+    ? (await git(["status", "--porcelain=v1"], worktreePath)).trim().length > 0
+    : false;
+
+  return { pathExists, registered, dirty };
+}
+
+export async function removeManagedWorktree(input: {
+  sourceRoot: string;
+  worktreePath: string;
+  discardChanges?: boolean;
+  config: ServerConfig;
+}): Promise<void> {
+  const sourceRoot = assertAllowedPath(input.sourceRoot, input.config.allowedRoots);
+  const worktreePath = assertAllowedPath(input.worktreePath, [input.config.worktreeRoot]);
+  const args = ["worktree", "remove"];
+  if (input.discardChanges) args.push("--force");
+  args.push(worktreePath);
+  await git(args, sourceRoot);
 }
 
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
@@ -157,6 +199,30 @@ function sanitizePathSegment(value: string): string {
     .replace(/[^a-zA-Z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
+}
+
+function parseWorktreePaths(output: string): string[] {
+  return output
+    .split("\0")
+    .filter((field) => field.startsWith("worktree "))
+    .map((field) => field.slice("worktree ".length));
+}
+
+async function directoryExists(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if (isMissingPathError(error)) return false;
+    throw error;
+  }
+}
+
+function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error.code === "ENOENT" || error.code === "ENOTDIR")
+  );
 }
 
 async function git(args: string[], cwd: string): Promise<string> {

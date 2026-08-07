@@ -95,9 +95,9 @@ MCP clients discover metadata from:
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Exposes `open_workspace`, `read`, `write`, `edit`, and `bash`. Clients use `bash` with tools such as `rg`, `find`, and `ls` for inspection. |
+| `minimal` | Default. Exposes `open_workspace`, `close_workspace`, `read`, `write`, `edit`, and `bash`. Clients use `bash` with tools such as `rg`, `find`, and `ls` for inspection. |
 | `full` | Exposes the minimal tools plus dedicated `grep`, `glob`, and `ls` tools. |
-| `codex` | Experimental. Exposes `open_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
+| `codex` | Experimental. Exposes `open_workspace`, `close_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
@@ -182,6 +182,35 @@ Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
 
 Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
 previews in logs.
+
+`open_workspace` tool-call logs correlate the MCP session ID prefix, a prefix of
+the hashed OpenAI conversation scope, and a prefix of the hashed canonical
+workspace target key. The raw `openai/session` value is neither logged nor
+stored. MCP transports are capped at 256 live registry entries and idle entries
+are evicted after 30 minutes; these limits do not close persisted workspaces.
+
+## Workspace Lifecycle Maintenance
+
+Workspace rows use the finite statuses `detached`, `open`, `closed`,
+`orphaned`, and `cleanup_failed`. DevSpace changes old `active` rows to
+`detached` during migration and also detaches open rows at server startup before
+restoring them on use.
+
+Run a non-destructive classification report with:
+
+```bash
+devspace workspaces prune
+```
+
+Apply only workspace IDs selected from that dry-run:
+
+```bash
+devspace workspaces prune --apply <workspace-id>...
+```
+
+The command never deletes user checkouts, dirty worktrees, Git-unregistered
+directories, or directories that are not represented by a DevSpace database
+row. Closed and orphaned history is retained without automatic compaction.
 
 ## Env-Only Example
 

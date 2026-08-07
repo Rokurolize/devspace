@@ -14,25 +14,47 @@ interface McpSessionEntry<TTransport> {
 
 export interface McpSessionRegistryOptions {
   now?: () => number;
+  maxSessions?: number;
 }
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly now: () => number;
+  private readonly maxSessions: number;
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
+    this.maxSessions = options.maxSessions ?? Number.POSITIVE_INFINITY;
+    if (
+      this.maxSessions !== Number.POSITIVE_INFINITY &&
+      (!Number.isInteger(this.maxSessions) || this.maxSessions < 1)
+    ) {
+      throw new Error("maxSessions must be a positive integer");
+    }
   }
 
   get size(): number {
     return this.sessions.size;
   }
 
-  register(sessionId: string, transport: TTransport): void {
+  async register(sessionId: string, transport: TTransport): Promise<McpSessionCloseResult[]> {
     this.sessions.set(sessionId, {
       transport,
       lastActivityAt: this.now(),
     });
+
+    if (this.sessions.size <= this.maxSessions) return [];
+
+    let oldestSession: [string, McpSessionEntry<TTransport>] | undefined;
+    for (const entry of this.sessions) {
+      if (!oldestSession || entry[1].lastActivityAt < oldestSession[1].lastActivityAt) {
+        oldestSession = entry;
+      }
+    }
+
+    if (!oldestSession) return [];
+    this.sessions.delete(oldestSession[0]);
+    return closeSessions([{ sessionId: oldestSession[0], transport: oldestSession[1].transport }]);
   }
 
   get(sessionId: string): TTransport | undefined {

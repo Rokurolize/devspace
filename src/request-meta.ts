@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 function metadataString(
   meta: unknown,
   key: string,
@@ -10,5 +12,12 @@ function metadataString(
 export function openAiConversationScopeId(
   meta: unknown,
 ): string | undefined {
-  return metadataString(meta, "openai/session");
+  const session = metadataString(meta, "openai/session");
+  return session ? correlationHash("openai-session", session) : undefined;
+}
+
+export function correlationHash(namespace: string, value: string): string {
+  return createHash("sha256")
+    .update(JSON.stringify([namespace, value]))
+    .digest("hex");
 }

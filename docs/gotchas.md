@@ -150,9 +150,25 @@ shows the combined changes and advances the review point automatically.
 
 ## Data Retention
 
-DevSpace does not currently prune workspace sessions, conversation bindings,
-or review refs. A future product retention policy will define safe cleanup for
-these records; no automatic deletion is performed today.
+DevSpace does not automatically delete workspace directories. Inspect cleanup
+candidates first:
+
+```bash
+devspace workspaces prune
+```
+
+This is always a dry-run. It can reclassify missing checkout or managed-worktree
+paths, identify clean registered managed worktrees, and leave dirty or
+Git-unregistered directories untouched. Apply only reviewed workspace IDs:
+
+```bash
+devspace workspaces prune --apply ws_example ws_other
+```
+
+Checkout directories are never deleted. Existing directories that are not both
+recorded as DevSpace-managed and registered with Git are never deleted. Closed
+and orphaned rows remain as lifecycle history until a separate retention policy
+is introduced.
 
 ## Workspace Path Rejected
 

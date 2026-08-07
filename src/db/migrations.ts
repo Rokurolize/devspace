@@ -27,6 +27,11 @@ const migrations: Migration[] = [
     name: "workspace-conversation-bindings",
     up: migrateWorkspaceConversationBindings,
   },
+  {
+    version: 5,
+    name: "workspace-lifecycle",
+    up: migrateWorkspaceLifecycle,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -195,6 +200,16 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
 
     create index if not exists workspace_conversation_bindings_workspace_idx
       on workspace_conversation_bindings(workspace_session_id);
+  `);
+}
+
+function migrateWorkspaceLifecycle(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workspace_sessions", "status_reason", "text");
+  addColumnIfMissing(sqlite, "workspace_sessions", "closed_at", "text");
+  sqlite.exec(`
+    update workspace_sessions
+    set status = 'detached', status_reason = null
+    where status in ('active', 'open');
   `);
 }
 

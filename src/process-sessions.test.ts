@@ -67,6 +67,36 @@ const background = await manager.start({
 assert.equal(background.running, true);
 assert.ok(background.sessionId);
 assert.equal(typeof background.sessionId, "number");
+assert.equal(manager.hasRunningSessions("workspace-a"), true);
+assert.equal(manager.hasRunningSessions("workspace-b"), false);
+assert.throws(
+  () => manager.beginWorkspaceClose("workspace-a"),
+  /has running processes/,
+);
+manager.beginShellCommand("workspace-shell");
+assert.throws(
+  () => manager.beginWorkspaceClose("workspace-shell"),
+  /has running processes/,
+);
+manager.endShellCommand("workspace-shell");
+manager.beginWorkspaceClose("workspace-b");
+assert.throws(
+  () => manager.beginWorkspaceClose("workspace-b"),
+  /already being closed/,
+);
+await assert.rejects(
+  manager.start({
+    workspaceId: "workspace-b",
+    command: "printf blocked",
+    cwd: process.cwd(),
+  }),
+  /being closed and cannot start a process/,
+);
+assert.throws(
+  () => manager.beginShellCommand("workspace-b"),
+  /being closed and cannot start a shell command/,
+);
+manager.endWorkspaceClose("workspace-b");
 
 await assert.rejects(
   manager.write({
@@ -85,6 +115,7 @@ const completed = await manager.write({
 assert.equal(completed.running, false);
 assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
+assert.equal(manager.hasRunningSessions("workspace-a"), false);
 
 const interactive = await manager.start({
   workspaceId: "workspace-a",

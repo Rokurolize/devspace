@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openAiConversationScopeId } from "./request-meta.js";
+import { correlationHash, openAiConversationScopeId } from "./request-meta.js";
 
 test("undefined request metadata has no conversation scope", () => {
   assert.equal(openAiConversationScopeId(undefined), undefined);
@@ -19,11 +19,16 @@ test("a non-string session value has no conversation scope", () => {
   assert.equal(openAiConversationScopeId({ "openai/session": {} }), undefined);
 });
 
-test("valid OpenAI session metadata returns the raw opaque session value", () => {
+test("valid OpenAI session metadata returns a stable redacted scope", () => {
+  const scope = openAiConversationScopeId({
+    "openai/session": "chat-session-opaque-value",
+  });
+  assert.match(scope ?? "", /^[a-f0-9]{64}$/);
   assert.equal(
+    scope,
     openAiConversationScopeId({ "openai/session": "chat-session-opaque-value" }),
-    "chat-session-opaque-value",
   );
+  assert.notEqual(scope, "chat-session-opaque-value");
 });
 
 test("unrelated metadata fields do not alter the selected conversation scope", () => {
@@ -33,6 +38,6 @@ test("unrelated metadata fields do not alter the selected conversation scope", (
       "openai/subject": "user-1",
       "openai/organization": "org-1",
     }),
-    "chat-session-opaque-value",
+    correlationHash("openai-session", "chat-session-opaque-value"),
   );
 });
