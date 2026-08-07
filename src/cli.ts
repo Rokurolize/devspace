@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
-import { loadConfig } from "./config.js";
+import { loadConfig, type ServerConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
   isLocalAgentProvider,
@@ -38,12 +38,18 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import { waitForChildSpawn } from "./process-platform.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import {
   applyWorkspaceReconcile,
   inspectWorkspaceSessions,
   type WorkspaceReconcileEntry,
 } from "./workspace-reconcile.js";
+import {
+  WorkspaceActivityStore,
+  startWorkspaceActivityHeartbeat,
+  type WorkspaceActivityLease,
+} from "./workspace-activity.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 
 type Command =
@@ -351,6 +357,7 @@ async function runWorkspacesPrune(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createWorkspaceStore(config.stateDir);
+  const workspaceActivity = new WorkspaceActivityStore(config.stateDir);
   try {
     const report = await inspectWorkspaceSessions(config, store);
     const candidates = report.filter((entry) => entry.action !== "none");
@@ -382,11 +389,17 @@ async function runWorkspacesPrune(args: string[]): Promise<void> {
       );
     }
 
-    await applyWorkspaceReconcile(config, store, workspaceIds);
+    const applied = await applyWorkspaceReconcile(
+      config,
+      store,
+      workspaceActivity,
+      workspaceIds,
+    );
     console.log("Applied workspace cleanup to the explicitly selected candidates:");
-    for (const entry of selected) console.log(formatWorkspaceReconcileEntry(entry));
+    for (const entry of applied) console.log(formatWorkspaceReconcileEntry(entry));
     console.log("Closed and orphaned workspace history remains in the database; no automatic compaction was performed.");
   } finally {
+    workspaceActivity.close();
     store.close?.();
   }
 }
@@ -504,7 +517,15 @@ async function runAgentsRun(args: string[]): Promise<void> {
       latestResponse: undefined,
       error: undefined,
     });
-    spawnAgentWorker(existing.id, promptFile);
+    try {
+      await spawnAgentWorkerWithActivity(config, existing, promptFile);
+    } catch (error) {
+      store.update(existing.id, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     console.log(formatAgentLine({
       ...existing,
       status: "running",
@@ -533,7 +554,15 @@ async function runAgentsRun(args: string[]): Promise<void> {
     thinking: target.thinking,
   });
 
-  spawnAgentWorker(record.id, promptFile);
+  try {
+    await spawnAgentWorkerWithActivity(config, record, promptFile);
+  } catch (error) {
+    store.update(record.id, {
+      status: "error",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
   console.log(formatAgentLine({ ...record, status: "running" }));
 }
 
@@ -567,18 +596,42 @@ async function runAgentsShow(args: string[]): Promise<void> {
 }
 
 async function runAgentsWorker(args: string[]): Promise<void> {
-  const [id, promptFileFlag, promptFile] = args;
+  const [id, promptFileFlag, promptFile, activityLeaseFlag, activityLeaseId] = args;
   if (!id || promptFileFlag !== "--prompt-file" || !promptFile) {
     throw new Error("Usage: devspace agents __worker <id> --prompt-file <path>");
+  }
+  if (
+    (activityLeaseFlag !== undefined || activityLeaseId !== undefined) &&
+    (activityLeaseFlag !== "--activity-lease" || !activityLeaseId)
+  ) {
+    throw new Error(
+      "Usage: devspace agents __worker <id> --prompt-file <path> [--activity-lease <id>]",
+    );
   }
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
   const record = store.get(id);
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
+  const workspaceActivity = activityLeaseId
+    ? new WorkspaceActivityStore(config.stateDir)
+    : undefined;
+  let activityLease: WorkspaceActivityLease | undefined;
+  let stopActivityHeartbeat: (() => void) | undefined;
 
   store.update(record.id, { status: "running", error: undefined });
   try {
+    if (workspaceActivity && activityLeaseId) {
+      if (!record.workspaceId) {
+        throw new Error("Subagent activity lease requires a workspace ID.");
+      }
+      activityLease = workspaceActivity.adopt(
+        activityLeaseId,
+        record.workspaceId,
+        "local_agent",
+      );
+      stopActivityHeartbeat = startWorkspaceActivityHeartbeat(activityLease);
+    }
     const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
     const profile = profiles.find((candidate) => candidate.name === record.profileName);
     const prompt = await readFile(promptFile, "utf8");
@@ -596,6 +649,10 @@ async function runAgentsWorker(args: string[]): Promise<void> {
       status: "error",
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    stopActivityHeartbeat?.();
+    activityLease?.release();
+    workspaceActivity?.close();
   }
 }
 
@@ -634,7 +691,11 @@ async function runRawLocalAgentProvider(
   });
 }
 
-function spawnAgentWorker(agentId: string, promptFile: string): void {
+async function spawnAgentWorker(
+  agentId: string,
+  promptFile: string,
+  activityLeaseId?: string,
+): Promise<void> {
   const child = spawn(process.execPath, [
     ...process.execArgv,
     fileURLToPath(import.meta.url),
@@ -643,12 +704,39 @@ function spawnAgentWorker(agentId: string, promptFile: string): void {
     agentId,
     "--prompt-file",
     promptFile,
+    ...(activityLeaseId ? ["--activity-lease", activityLeaseId] : []),
   ], {
     detached: true,
     stdio: "ignore",
     env: process.env,
   });
-  child.unref();
+  await waitForChildSpawn(child);
+}
+
+async function spawnAgentWorkerWithActivity(
+  config: ServerConfig,
+  record: LocalAgentRecord,
+  promptFile: string,
+): Promise<void> {
+  if (!record.workspaceId) {
+    await spawnAgentWorker(record.id, promptFile);
+    return;
+  }
+
+  const workspaceActivity = new WorkspaceActivityStore(config.stateDir);
+  const activityLease = workspaceActivity.acquireShared(
+    record.workspaceId,
+    "local_agent",
+    record.id,
+  );
+  try {
+    await spawnAgentWorker(record.id, promptFile, activityLease.id);
+  } catch (error) {
+    activityLease.release();
+    throw error;
+  } finally {
+    workspaceActivity.close();
+  }
 }
 
 function writeAgentPromptFile(prompt: string): string {

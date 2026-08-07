@@ -396,6 +396,7 @@ class JsonLineRpc {
     reject: (error: Error) => void;
   }>();
   private readonly eventSubscribers = new Set<(event: unknown) => void>();
+  private readonly fatalSubscribers = new Set<(error: Error) => void>();
   private buffer = "";
   private nextId = 1;
   private stderr = "";
@@ -429,17 +430,27 @@ class JsonLineRpc {
   }
 
   waitForEvent(predicate: (event: unknown) => boolean, timeoutMs: number): Promise<unknown> {
+    if (this.fatalError) return Promise.reject(this.fatalError);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        unsubscribe();
+        cleanup();
         reject(new Error(`Pi RPC timed out waiting for agent completion\n${this.stderr}`.trim()));
       }, timeoutMs);
-      const unsubscribe = this.onEvent((event) => {
+      const unsubscribeEvent = this.onEvent((event) => {
         if (!predicate(event)) return;
-        clearTimeout(timer);
-        unsubscribe();
+        cleanup();
         resolve(event);
       });
+      const onFatal = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      this.fatalSubscribers.add(onFatal);
+      const cleanup = () => {
+        clearTimeout(timer);
+        unsubscribeEvent();
+        this.fatalSubscribers.delete(onFatal);
+      };
     });
   }
 
@@ -483,6 +494,8 @@ class JsonLineRpc {
       pending.reject(error);
     }
     this.pending.clear();
+    for (const subscriber of this.fatalSubscribers) subscriber(error);
+    this.fatalSubscribers.clear();
   }
 }
 

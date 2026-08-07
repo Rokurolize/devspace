@@ -47,6 +47,8 @@ export interface WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    status?: WorkspaceStatus;
+    statusReason?: string;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
   listSessions(): WorkspaceSession[];
@@ -88,12 +90,15 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    status?: WorkspaceStatus;
+    statusReason?: string;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const session: WorkspaceSession = {
       id: input.id,
       root: input.root,
-      status: "open",
+      status: input.status ?? "open",
+      statusReason: input.statusReason,
       mode: input.mode ?? "checkout",
       sourceRoot: input.sourceRoot,
       baseRef: input.baseRef,
@@ -114,8 +119,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         baseRef: session.baseRef ?? null,
         baseSha: session.baseSha ?? null,
         managed: String(session.managed),
-        statusReason: null,
-        closedAt: null,
+        statusReason: session.statusReason ?? null,
+        closedAt: session.status === "closed" ? now : null,
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
       })

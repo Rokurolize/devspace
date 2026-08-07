@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import {
+  startWorkspaceActivityHeartbeat,
+  type WorkspaceActivityLease,
+} from "./workspace-activity.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -9,6 +13,7 @@ const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const PROCESS_SHUTDOWN_GRACE_MS = 3_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
@@ -22,6 +27,7 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  activityLease?: WorkspaceActivityLease;
 }
 
 export interface WriteStdinInput {
@@ -64,6 +70,8 @@ interface ProcessSession {
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
+  activityLease?: WorkspaceActivityLease;
+  stopActivityHeartbeat?: () => void;
 }
 
 interface ProcessSessionManagerOptions {
@@ -213,8 +221,6 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 
 export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
-  private readonly activeShellCommands = new Map<string, number>();
-  private readonly closingWorkspaces = new Set<string>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private nextSessionId = 1;
@@ -225,18 +231,18 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
-    if (this.closingWorkspaces.has(input.workspaceId)) {
-      throw new Error(`Workspace ${input.workspaceId} is being closed and cannot start a process.`);
-    }
-
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
 
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
+      if (session.activityLease) {
+        session.stopActivityHeartbeat = startWorkspaceActivityHeartbeat(session.activityLease);
+      }
     } catch (error) {
       this.sessions.delete(session.id);
+      session.activityLease?.release();
       throw error;
     }
 
@@ -287,57 +293,44 @@ export class ProcessSessionManager {
     if (session.running) session.process?.kill("SIGTERM");
   }
 
-  hasRunningSessions(workspaceId: string): boolean {
-    return Array.from(this.sessions.values()).some(
-      (session) => session.workspaceId === workspaceId && session.running,
-    );
-  }
-
-  beginShellCommand(workspaceId: string): void {
-    if (this.closingWorkspaces.has(workspaceId)) {
-      throw new Error(`Workspace ${workspaceId} is being closed and cannot start a shell command.`);
-    }
-    this.activeShellCommands.set(
-      workspaceId,
-      (this.activeShellCommands.get(workspaceId) ?? 0) + 1,
-    );
-  }
-
-  endShellCommand(workspaceId: string): void {
-    const remaining = (this.activeShellCommands.get(workspaceId) ?? 0) - 1;
-    if (remaining > 0) this.activeShellCommands.set(workspaceId, remaining);
-    else this.activeShellCommands.delete(workspaceId);
-  }
-
-  beginWorkspaceClose(workspaceId: string): void {
-    if (this.closingWorkspaces.has(workspaceId)) {
-      throw new Error(`Workspace ${workspaceId} is already being closed.`);
-    }
-
-    this.closingWorkspaces.add(workspaceId);
-    if (
-      this.hasRunningSessions(workspaceId) ||
-      (this.activeShellCommands.get(workspaceId) ?? 0) > 0
-    ) {
-      this.closingWorkspaces.delete(workspaceId);
-      throw new Error(
-        `Workspace ${workspaceId} has running processes. Stop them before closing the workspace.`,
-      );
-    }
-  }
-
-  endWorkspaceClose(workspaceId: string): void {
-    this.closingWorkspaces.delete(workspaceId);
-  }
-
-  shutdown(): void {
-    for (const session of this.sessions.values()) {
+  async shutdown(): Promise<void> {
+    const sessions = Array.from(this.sessions.values());
+    for (const session of sessions) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.running) session.process?.kill("SIGTERM");
     }
+
+    await this.waitForSessions(sessions, PROCESS_SHUTDOWN_GRACE_MS);
+    const remaining = sessions.filter((session) => session.running);
+    for (const session of remaining) session.process?.kill("SIGKILL");
+    await this.waitForSessions(remaining, PROCESS_SHUTDOWN_GRACE_MS);
+
+    for (const session of sessions) {
+      if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+      if (session.running) this.abandonActivity(session);
+      else this.releaseActivity(session);
+    }
     this.sessions.clear();
-    this.activeShellCommands.clear();
-    this.closingWorkspaces.clear();
+  }
+
+  private async waitForSessions(
+    sessions: ProcessSession[],
+    timeoutMs: number,
+  ): Promise<void> {
+    const running = sessions.filter((session) => session.running);
+    if (running.length === 0) return;
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.all(running.map((session) => session.exitPromise)),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
@@ -370,6 +363,7 @@ export class ProcessSessionManager {
       running: true,
       exitPromise,
       resolveExit,
+      activityLease: input.activityLease,
     };
   }
 
@@ -440,12 +434,16 @@ export class ProcessSessionManager {
     session.running = false;
     session.exitCode = exitCode;
     session.signal = signal;
-    session.resolveExit();
-    session.cleanupTimer = setTimeout(
-      () => this.sessions.delete(session.id),
-      this.completedSessionTtlMs,
-    );
-    session.cleanupTimer.unref();
+    try {
+      this.releaseActivity(session);
+    } finally {
+      session.resolveExit();
+      session.cleanupTimer = setTimeout(
+        () => this.sessions.delete(session.id),
+        this.completedSessionTtlMs,
+      );
+      session.cleanupTimer.unref();
+    }
   }
 
   private append(session: ProcessSession, output: string): void {
@@ -481,5 +479,25 @@ export class ProcessSessionManager {
     const session = this.sessions.get(sessionId);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     this.sessions.delete(sessionId);
+  }
+
+  private releaseActivity(session: ProcessSession): void {
+    session.stopActivityHeartbeat?.();
+    session.stopActivityHeartbeat = undefined;
+    try {
+      session.activityLease?.release();
+    } catch {
+      // A custom or older lease implementation must not break process exit.
+      // Persisted leases remain fail-closed until their expiry.
+    }
+    session.activityLease = undefined;
+  }
+
+  private abandonActivity(session: ProcessSession): void {
+    session.stopActivityHeartbeat?.();
+    session.stopActivityHeartbeat = undefined;
+    // Keep the lease row until its expiry. If a process survives SIGKILL, a
+    // restarted server must not immediately treat its workspace as idle.
+    session.activityLease = undefined;
   }
 }

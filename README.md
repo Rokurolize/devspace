@@ -250,3 +250,8 @@ npm test
 npm run build
 npm run start
 ```
+
+`npm run dev` builds the MCP App once before starting the server, then keeps a
+separate Vite watch build running. Changes under `src/ui/` rebuild the app
+without restarting MCP sessions; backend source changes still restart the MCP
+server.

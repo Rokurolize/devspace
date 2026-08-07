@@ -53,6 +53,12 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { correlationHash, openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
+import {
+  startWorkspaceActivityHeartbeat,
+  WorkspaceActivityStore,
+  withWorkspaceActivity,
+  type WorkspaceActivityLease,
+} from "./workspace-activity.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
@@ -565,6 +571,8 @@ function registerCodexProcessTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
+  workspaceActivity: WorkspaceActivityStore,
+  activityOwnerPrefix: string,
 ): void {
   registerAppTool(
     server,
@@ -607,19 +615,31 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
-      const snapshot = await processSessions.start({
+      const activityLease = workspaceActivity.acquireShared(
         workspaceId,
-        command: cmd,
-        cwd,
-        workspaceRoot: workspace.root,
-        tty,
-        columns,
-        rows,
-        yieldTimeMs,
-        maxOutputTokens,
-      });
+        "process",
+        `${activityOwnerPrefix}:exec_command`,
+      );
+      let snapshot;
+      try {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+        snapshot = await processSessions.start({
+          workspaceId,
+          command: cmd,
+          cwd,
+          workspaceRoot: workspace.root,
+          tty,
+          columns,
+          rows,
+          yieldTimeMs,
+          maxOutputTokens,
+          activityLease,
+        });
+      } catch (error) {
+        activityLease.release();
+        throw error;
+      }
 
       logToolCall(config, {
         tool: "exec_command",
@@ -711,6 +731,8 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  workspaceActivity: WorkspaceActivityStore,
+  activityOwnerPrefix: string,
   mcpSessionContext: McpSessionContext = {},
 ): McpServer {
   const server = new McpServer(
@@ -724,6 +746,17 @@ export function createMcpServer(
     {
       instructions: serverInstructions(config),
     },
+  );
+  const runWorkspaceOperation = <T>(
+    workspaceId: string,
+    operationName: string,
+    operation: () => Promise<T>,
+  ) => withWorkspaceActivity(
+    workspaceActivity,
+    workspaceId,
+    "operation",
+    `${activityOwnerPrefix}:${operationName}`,
+    operation,
   );
 
   registerAppResource(
@@ -1006,8 +1039,12 @@ export function createMcpServer(
     },
     async ({ workspaceId, discardChanges }) => {
       const startedAt = performance.now();
+      let activityLease: WorkspaceActivityLease;
       try {
-        processSessions.beginWorkspaceClose(workspaceId);
+        activityLease = workspaceActivity.acquireClose(
+          workspaceId,
+          `${activityOwnerPrefix}:close_workspace`,
+        );
       } catch (cause) {
         const error = cause instanceof Error ? cause.message : String(cause);
         logToolCall(config, {
@@ -1021,10 +1058,12 @@ export function createMcpServer(
       }
 
       let result;
+      const stopHeartbeat = startWorkspaceActivityHeartbeat(activityLease);
       try {
         result = await workspaces.closeWorkspace(workspaceId, { discardChanges });
       } finally {
-        processSessions.endWorkspaceClose(workspaceId);
+        stopHeartbeat();
+        activityLease.release();
       }
       logToolCall(config, {
         tool: toolNames.closeWorkspace,
@@ -1101,17 +1140,18 @@ export function createMcpServer(
       annotations: { readOnlyHint: true },
     },
     async ({ workspaceId, ...input }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const readPath = workspaces.resolveReadPath(workspace, input.path);
-      const response = await readFileTool(
-        { ...input, path: readPath.absolutePath },
-        {
-          cwd: workspace.root,
-          root: workspace.root,
-          readRoots: readPath.readRoots,
-        },
-      );
+      return runWorkspaceOperation(workspaceId, toolNames.read, async () => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const readPath = workspaces.resolveReadPath(workspace, input.path);
+        const response = await readFileTool(
+          { ...input, path: readPath.absolutePath },
+          {
+            cwd: workspace.root,
+            root: workspace.root,
+            readRoots: readPath.readRoots,
+          },
+        );
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1136,21 +1176,22 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.read,
-          card: {
-            workspaceId,
-            path: input.path,
-            summary,
-            payload: { content: response.content },
+        return {
+          ...response,
+          _meta: {
+            tool: toolNames.read,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: { content: response.content },
+            },
           },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      });
     },
   );
 
@@ -1176,13 +1217,14 @@ export function createMcpServer(
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-      });
+      return runWorkspaceOperation(workspaceId, toolNames.write, async () => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        workspaces.resolvePath(workspace, input.path);
+        const response = await writeFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1208,24 +1250,25 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.write,
-          card: {
-            workspaceId,
-            path: input.path,
-            summary,
-            payload: {
-              content: response.content,
-              patch,
+        return {
+          ...response,
+          _meta: {
+            tool: toolNames.write,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: {
+                content: response.content,
+                patch,
+              },
             },
           },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      });
     },
   );
 
@@ -1263,13 +1306,14 @@ export function createMcpServer(
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-      });
+      return runWorkspaceOperation(workspaceId, toolNames.edit, async () => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        workspaces.resolvePath(workspace, input.path);
+        const response = await editFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1297,25 +1341,26 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return {
-        content: editContent,
-        _meta: {
-          tool: toolNames.edit,
-          card: {
-            workspaceId,
-            path: input.path,
-            summary,
-            payload: {
-              diff: response.details?.diff,
-              patch: response.details?.patch,
+        return {
+          content: editContent,
+          _meta: {
+            tool: toolNames.edit,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: {
+                diff: response.details?.diff,
+                patch: response.details?.patch,
+              },
             },
           },
-        },
-        structuredContent: {
-          status: "applied",
-          result: contentText(editContent),
-        },
-      };
+          structuredContent: {
+            status: "applied",
+            result: contentText(editContent),
+          },
+        };
+      });
     },
   );
   }
@@ -1351,15 +1396,16 @@ export function createMcpServer(
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, patch }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const applied = await applyPatch(workspace.root, patch);
-        const paths = applied.files.map((file) => file.path).join(", ");
-        const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
-        const content = [textBlock(result)];
-        const displayPath = applied.files.length === 1
-          ? applied.files[0]?.path
-          : `${applied.files.length} files`;
+        return runWorkspaceOperation(workspaceId, "apply_patch", async () => {
+          const startedAt = performance.now();
+          const workspace = workspaces.getWorkspace(workspaceId);
+          const applied = await applyPatch(workspace.root, patch);
+          const paths = applied.files.map((file) => file.path).join(", ");
+          const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
+          const content = [textBlock(result)];
+          const displayPath = applied.files.length === 1
+            ? applied.files[0]?.path
+            : `${applied.files.length} files`;
 
         logToolCall(config, {
           tool: "apply_patch",
@@ -1368,29 +1414,30 @@ export function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
 
-        return {
-          content,
-          _meta: {
-            tool: "apply_patch",
-            card: {
-              workspaceId,
-              path: displayPath,
-              summary: {
-                files: applied.files.length,
-                additions: applied.additions,
-                removals: applied.removals,
+          return {
+            content,
+            _meta: {
+              tool: "apply_patch",
+              card: {
+                workspaceId,
+                path: displayPath,
+                summary: {
+                  files: applied.files.length,
+                  additions: applied.additions,
+                  removals: applied.removals,
+                },
+                files: applied.files,
+                payload: { patch: applied.patch },
               },
-              files: applied.files,
-              payload: { patch: applied.patch },
             },
-          },
-          structuredContent: {
-            result,
-            additions: applied.additions,
-            removals: applied.removals,
-            files: applied.files,
-          },
-        };
+            structuredContent: {
+              result,
+              additions: applied.additions,
+              removals: applied.removals,
+              files: applied.files,
+            },
+          };
+        });
       },
     );
   }
@@ -1413,13 +1460,14 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const review = await reviewCheckpoints.reviewChanges({
-          workspaceId,
-          root: workspace.root,
-          markReviewed: true,
-        });
+        return runWorkspaceOperation(workspaceId, "show_changes", async () => {
+          const startedAt = performance.now();
+          const workspace = workspaces.getWorkspace(workspaceId);
+          const review = await reviewCheckpoints.reviewChanges({
+            workspaceId,
+            root: workspace.root,
+            markReviewed: true,
+          });
 
         const content = [textBlock(review.result)];
         logToolCall(config, {
@@ -1429,23 +1477,24 @@ export function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
 
-        return {
-          content,
-          _meta: {
-            tool: "show_changes",
-            card: {
-              workspaceId,
-              summary: review.summary,
-              files: review.files,
-              payload: {
-                patch: review.patch,
+          return {
+            content,
+            _meta: {
+              tool: "show_changes",
+              card: {
+                workspaceId,
+                summary: review.summary,
+                files: review.files,
+                payload: {
+                  patch: review.patch,
+                },
               },
             },
-          },
-          structuredContent: {
-            result: contentText(content),
-          },
-        };
+            structuredContent: {
+              result: contentText(content),
+            },
+          };
+        });
       },
     );
   }
@@ -1476,13 +1525,14 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await grepFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+        return runWorkspaceOperation(workspaceId, toolNames.grep, async () => {
+          const startedAt = performance.now();
+          const workspace = workspaces.getWorkspace(workspaceId);
+          if (input.path) workspaces.resolvePath(workspace, input.path);
+          const response = await grepFilesTool(input, {
+            cwd: workspace.root,
+            root: workspace.root,
+          });
 
         if (response.isError) {
           logFailedToolResponse(config, {
@@ -1506,21 +1556,22 @@ export function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
 
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.grep,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
+          return {
+            ...response,
+            _meta: {
+              tool: toolNames.grep,
+              card: {
+                workspaceId,
+                path: input.path,
+                summary,
+                payload: { content: response.content },
+              },
             },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
+            structuredContent: {
+              result: contentText(response.content),
+            },
+          };
+        });
       },
     );
 
@@ -1546,13 +1597,14 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await findFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+        return runWorkspaceOperation(workspaceId, toolNames.glob, async () => {
+          const startedAt = performance.now();
+          const workspace = workspaces.getWorkspace(workspaceId);
+          if (input.path) workspaces.resolvePath(workspace, input.path);
+          const response = await findFilesTool(input, {
+            cwd: workspace.root,
+            root: workspace.root,
+          });
 
         if (response.isError) {
           logFailedToolResponse(config, {
@@ -1576,21 +1628,22 @@ export function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
 
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.glob,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
+          return {
+            ...response,
+            _meta: {
+              tool: toolNames.glob,
+              card: {
+                workspaceId,
+                path: input.path,
+                summary,
+                payload: { content: response.content },
+              },
             },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
+            structuredContent: {
+              result: contentText(response.content),
+            },
+          };
+        });
       },
     );
 
@@ -1616,13 +1669,14 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        workspaces.resolvePath(workspace, input.path);
-        const response = await listDirectoryTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+        return runWorkspaceOperation(workspaceId, toolNames.ls, async () => {
+          const startedAt = performance.now();
+          const workspace = workspaces.getWorkspace(workspaceId);
+          workspaces.resolvePath(workspace, input.path);
+          const response = await listDirectoryTool(input, {
+            cwd: workspace.root,
+            root: workspace.root,
+          });
 
         if (response.isError) {
           logFailedToolResponse(config, {
@@ -1642,21 +1696,22 @@ export function createMcpServer(
           durationMs: Math.round(performance.now() - startedAt),
         });
 
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.ls,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
+          return {
+            ...response,
+            _meta: {
+              tool: toolNames.ls,
+              card: {
+                workspaceId,
+                path: input.path,
+                summary,
+                payload: { content: response.content },
+              },
             },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
+            structuredContent: {
+              result: contentText(response.content),
+            },
+          };
+        });
       },
     );
   }
@@ -1697,22 +1752,17 @@ export function createMcpServer(
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
-      const startedAt = performance.now();
-      processSessions.beginShellCommand(workspaceId);
-      let response;
-      try {
+      return runWorkspaceOperation(workspaceId, toolNames.shell, async () => {
+        const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         const cwd = workspaces.resolveWorkingDirectory(
           workspace,
           workingDirectory,
         );
-        response = await runShellTool(input, {
+        const response = await runShellTool(input, {
           cwd,
           root: workspace.root,
         });
-      } finally {
-        processSessions.endShellCommand(workspaceId);
-      }
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1740,33 +1790,43 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.shell,
-          card: {
-            workspaceId,
-            path: workingDirectory,
-            summary,
-            payload: { content: response.content },
+        return {
+          ...response,
+          _meta: {
+            tool: toolNames.shell,
+            card: {
+              workspaceId,
+              path: workingDirectory,
+              summary,
+              payload: { content: response.content },
+            },
           },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      });
     },
   );
   }
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
+    registerCodexProcessTools(
+      server,
+      config,
+      workspaces,
+      processSessions,
+      workspaceActivity,
+      activityOwnerPrefix,
+    );
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(server, {
       config,
       workspaces,
+      workspaceActivity,
+      activityOwnerPrefix,
       incomingArtifactAdapters,
     });
   }
@@ -1803,6 +1863,8 @@ export function createServer(
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  const workspaceActivity = new WorkspaceActivityStore(config.stateDir);
+  const activityOwnerPrefix = `server:${randomUUID()}`;
   workspaceStore.detachOpenSessions();
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
@@ -1983,6 +2045,8 @@ export function createServer(
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
+          workspaceActivity,
+          activityOwnerPrefix,
           mcpSessionContext,
         );
         await server.connect(transport);
@@ -2013,8 +2077,9 @@ export function createServer(
         clearInterval(sessionCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
-        processSessions.shutdown();
+        await processSessions.shutdown();
         workspaces.detachAll();
+        workspaceActivity.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

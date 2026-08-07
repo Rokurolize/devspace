@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -99,6 +99,164 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
 
   const resolvedReadme = context.registry.resolvePath(opened.workspace, "README.md");
   assert.equal(resolvedReadme.startsWith(opened.workspace.root), true);
+});
+
+test("failed worktree context initialization removes the managed worktree", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const configDir = join(context.root, ".failing-devspace");
+  const agentsDir = join(configDir, "agents");
+  const worktreeRoot = join(context.root, ".failing-worktrees");
+  const stateDir = join(context.root, ".failing-state");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(agentsDir, "not a directory\n");
+
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_ALLOWED_ROOTS: context.root,
+    DEVSPACE_WORKTREE_ROOT: worktreeRoot,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_AGENT_DIR: context.agentDir,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const store = new SqliteWorkspaceStore(stateDir);
+  const registry = new WorkspaceRegistry(config, store);
+  t.after(() => store.close());
+
+  await assert.rejects(
+    () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    /not a directory|ENOTDIR/i,
+  );
+  assert.deepEqual(await readdir(worktreeRoot), []);
+  assert.equal(store.listSessions().length, 0);
+
+  const worktreeList = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    { cwd: gitRoot, encoding: "utf8" },
+  );
+  assert.deepEqual(
+    worktreeList.stdout
+      .split("\0")
+      .filter((field) => field.startsWith("worktree "))
+      .map((field) => field.slice("worktree ".length)),
+    [gitRoot],
+  );
+});
+
+test("failed worktree compensation persists a cleanup record", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const configDir = join(context.root, ".cleanup-failure-devspace");
+  const agentsPath = join(configDir, "agents");
+  const worktreeRoot = join(context.root, ".cleanup-failure-worktrees");
+  const stateDir = join(context.root, ".cleanup-failure-state");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(agentsPath, "not a directory\n");
+
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_ALLOWED_ROOTS: context.root,
+    DEVSPACE_WORKTREE_ROOT: worktreeRoot,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_AGENT_DIR: context.agentDir,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const store = new SqliteWorkspaceStore(stateDir);
+  const registry = new WorkspaceRegistry(config, store, {
+    removeManagedWorktree: async () => {
+      throw new Error("simulated cleanup failure");
+    },
+  });
+
+  let leakedWorktree: string | undefined;
+  try {
+    await assert.rejects(
+      () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+      (error: unknown) => error instanceof AggregateError,
+    );
+    const sessions = store.listSessions();
+    assert.equal(sessions.length, 1);
+    const [session] = sessions;
+    assert.ok(session);
+    leakedWorktree = session.root;
+    assert.equal(session.mode, "worktree");
+    assert.equal(session.managed, true);
+    assert.equal(session.status, "cleanup_failed");
+    assert.match(session.statusReason ?? "", /simulated cleanup failure/);
+    assert.equal((await stat(session.root)).isDirectory(), true);
+  } finally {
+    if (leakedWorktree) {
+      await git(gitRoot, ["worktree", "remove", "--force", leakedWorktree]);
+    }
+    store.close();
+  }
+});
+
+test("Git workspaces discover only tracked and standard non-ignored nested instructions", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  await writeFile(join(gitRoot, ".gitignore"), "ignored-context/\n");
+  await mkdir(join(gitRoot, "tracked-context"));
+  await writeFile(join(gitRoot, "tracked-context", "AGENTS.md"), "tracked instructions\n");
+  await mkdir(join(gitRoot, "sibling-context"));
+  await writeFile(join(gitRoot, "sibling-context", "CLAUDE.md"), "sibling instructions\n");
+  await mkdir(join(gitRoot, "deleted-context"));
+  await writeFile(join(gitRoot, "deleted-context", "AGENTS.md"), "deleted instructions\n");
+  await git(gitRoot, ["add", ".gitignore", "tracked-context", "sibling-context", "deleted-context"]);
+  await git(gitRoot, ["commit", "-m", "Add nested instructions"]);
+  await rm(join(gitRoot, "deleted-context", "AGENTS.md"));
+
+  await mkdir(join(gitRoot, "untracked-context"));
+  await writeFile(join(gitRoot, "untracked-context", "CLAUDE.md"), "untracked instructions\n");
+  await mkdir(join(gitRoot, "ignored-context"));
+  await writeFile(join(gitRoot, "ignored-context", "AGENTS.md"), "ignored instructions\n");
+
+  const nestedRepository = join(gitRoot, "nested-repository");
+  await mkdir(nestedRepository);
+  await git(nestedRepository, ["init"]);
+  await git(nestedRepository, ["config", "user.email", "devspace@example.com"]);
+  await git(nestedRepository, ["config", "user.name", "DevSpace Test"]);
+  await writeFile(join(nestedRepository, "AGENTS.md"), "nested repository instructions\n");
+  await git(nestedRepository, ["add", "AGENTS.md"]);
+  await git(nestedRepository, ["commit", "-m", "Initial commit"]);
+
+  if (platform() !== "win32") {
+    await mkdir(join(gitRoot, "symlink-context"));
+    await writeFile(join(context.outsideRoot, "AGENTS.md"), "outside instructions\n");
+    await symlink(
+      join(context.outsideRoot, "AGENTS.md"),
+      join(gitRoot, "symlink-context", "AGENTS.md"),
+    );
+    await git(gitRoot, ["add", "symlink-context/AGENTS.md"]);
+  }
+
+  const opened = await context.registry.openWorkspace(gitRoot);
+  assert.deepEqual(
+    opened.availableAgentsFiles.map((file) => file.path),
+    [
+      join(gitRoot, "sibling-context", "CLAUDE.md"),
+      join(gitRoot, "tracked-context", "AGENTS.md"),
+      join(gitRoot, "untracked-context", "CLAUDE.md"),
+    ],
+  );
+
+  const subdirectory = await context.registry.openWorkspace(join(gitRoot, "tracked-context"));
+  assert.deepEqual(
+    subdirectory.agentsFiles.map((file) => file.content),
+    ["global instructions\n", "tracked instructions\n"],
+  );
+  assert.deepEqual(subdirectory.availableAgentsFiles, []);
+
+  const nested = await context.registry.openWorkspace(nestedRepository);
+  assert.deepEqual(
+    nested.agentsFiles.map((file) => file.content),
+    ["global instructions\n", "nested repository instructions\n"],
+  );
 });
 
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {

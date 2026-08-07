@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -11,6 +11,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
+import { WorkspaceActivityStore } from "./workspace-activity.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -107,6 +108,34 @@ test("new worktrees always receive a fresh workspace and complete worktree conte
   assert.match(responseText(checkoutAgain), /same checkout previously opened/);
 });
 
+test("close_workspace waits for workspace activity before removing a managed worktree", async (t) => {
+  const context = await fixture(t, { git: true });
+  const opened = await callOpen(context.client, context.project, "chat-1", "worktree");
+  const workspaceId = String(structuredContent(opened).workspaceId);
+  const root = String(structuredContent(opened).root);
+  const activeLease = context.activity.acquireShared(
+    workspaceId,
+    "operation",
+    "paused-test-operation",
+  );
+
+  const blocked = await context.client.callTool({
+    name: "close_workspace",
+    arguments: { workspaceId },
+  });
+  assert.equal(blocked.isError, true);
+  assert.match(responseText(blocked), /active operations/);
+  assert.equal((await stat(root)).isDirectory(), true);
+
+  activeLease.release();
+  const closed = await context.client.callTool({
+    name: "close_workspace",
+    arguments: { workspaceId },
+  });
+  assert.equal(structuredContent(closed).status, "closed");
+  await assert.rejects(() => stat(root), { code: "ENOENT" });
+});
+
 test("checkout opened after a worktree receives its own complete context", async (t) => {
   const context = await fixture(t, { git: true });
   const worktree = await callOpen(context.client, context.project, "chat-1", "worktree");
@@ -142,6 +171,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
   await context.close();
 
   const restoredStore = new SqliteWorkspaceStore(context.stateDir);
+  const restoredActivity = new WorkspaceActivityStore(context.stateDir);
   const restoredServer = createMcpServer(
     context.config,
     new WorkspaceRegistry(context.config, restoredStore),
@@ -149,6 +179,8 @@ test("checkout reuse and context suppression survive a registry restart", async 
     new ProcessSessionManager(),
     [],
     [],
+    restoredActivity,
+    "restored-test",
   );
   const [restoredClientTransport, restoredServerTransport] = InMemoryTransport.createLinkedPair();
   const restoredClient = new Client({ name: "devspace-restored-test-client", version: "1.0.0" });
@@ -158,6 +190,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
     restoredClosed = true;
     await restoredClient.close();
     await restoredServer.close();
+    restoredActivity.close();
     restoredStore.close();
   };
   t.after(closeRestored);
@@ -182,6 +215,7 @@ interface ServerFixture {
   project: string;
   config: ServerConfig;
   stateDir: string;
+  activity: WorkspaceActivityStore;
   close: () => Promise<void>;
 }
 
@@ -224,6 +258,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     PORT: "1",
   });
   const store = new SqliteWorkspaceStore(stateDir);
+  const activity = new WorkspaceActivityStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
   const server = createMcpServer(
     config,
@@ -232,6 +267,8 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     new ProcessSessionManager(),
     [],
     [],
+    activity,
+    "test",
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -246,6 +283,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     closed = true;
     await client.close();
     await server.close();
+    activity.close();
     store.close();
   };
 
@@ -254,7 +292,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, config, stateDir, close };
+  return { client, project, config, stateDir, activity, close };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

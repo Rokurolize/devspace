@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { LocalAgentStore } from "./local-agent-store.js";
+import { WorkspaceActivityStore } from "./workspace-activity.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -93,6 +94,48 @@ try {
     DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   }).subagents, true);
+
+  const activityStore = new WorkspaceActivityStore(stateDir);
+  const closeLease = activityStore.acquireClose("ws_current", "cli-agent-close-test");
+  try {
+    assert.throws(
+      () => execFileSync(
+        "node",
+        [
+          "--import",
+          "tsx",
+          "src/cli.ts",
+          "agents",
+          "run",
+          current.id,
+          "blocked follow-up",
+        ],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            DEVSPACE_CONFIG_DIR: configDir,
+            DEVSPACE_ALLOWED_ROOTS: projectRoot,
+            DEVSPACE_STATE_DIR: stateDir,
+            DEVSPACE_WORKSPACE_ID: "ws_current",
+            DEVSPACE_WORKSPACE_ROOT: projectRoot,
+            DEVSPACE_SUBAGENTS: "1",
+            DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+          },
+        },
+      ),
+      /being closed/,
+    );
+  } finally {
+    closeLease.release();
+    activityStore.close();
+  }
+  const failedAgentStore = new LocalAgentStore(stateDir);
+  const failedAgent = failedAgentStore.get(current.id);
+  assert.equal(failedAgent?.status, "error");
+  assert.match(failedAgent?.error ?? "", /being closed/);
+  failedAgentStore.close();
 
   const pruneRoot = join(projectRoot, "missing-workspace");
   mkdirSync(pruneRoot);

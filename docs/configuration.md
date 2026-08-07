@@ -196,6 +196,12 @@ Workspace rows use the finite statuses `detached`, `open`, `closed`,
 `detached` during migration and also detaches open rows at server startup before
 restoring them on use.
 
+Workspace-scoped tools, long-running processes, and local-agent workers hold
+expiring activity leases in SQLite. `close_workspace` and prune apply acquire an
+exclusive lease, so they refuse to remove or reclassify a workspace while those
+operations are active. Leases are refreshed while work continues and expire
+after an abnormal process exit.
+
 Run a non-destructive classification report with:
 
 ```bash
@@ -210,7 +216,9 @@ devspace workspaces prune --apply <workspace-id>...
 
 The command never deletes user checkouts, dirty worktrees, Git-unregistered
 directories, or directories that are not represented by a DevSpace database
-row. Closed and orphaned history is retained without automatic compaction.
+row. It also rechecks each selected candidate after acquiring its exclusive
+lease instead of acting on a stale dry-run classification. Closed and orphaned
+history is retained without automatic compaction.
 
 ## Env-Only Example
 

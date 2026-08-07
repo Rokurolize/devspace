@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import type { WorkspaceActivityLease } from "./workspace-activity.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -58,45 +59,36 @@ const environment = await manager.start({
 assert.equal(environment.running, false);
 assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
 
+const releaseFailure = await manager.start({
+  workspaceId: "workspace-release-failure",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('release-safe')"`,
+  yieldTimeMs: 2_000,
+  activityLease: {
+    id: "lease-release-failure",
+    workspaceId: "workspace-release-failure",
+    kind: "process",
+    heartbeatIntervalMs: 25,
+    heartbeat: () => undefined,
+    release: () => {
+      throw new Error("simulated release failure");
+    },
+  },
+});
+assert.equal(releaseFailure.running, false);
+assert.equal(releaseFailure.exitCode, 0);
+assert.match(releaseFailure.output, /release-safe/);
+
 const background = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),
   command: `${node} -e "setTimeout(() => console.log('finished'), 100)"`,
   yieldTimeMs: 5,
+  activityLease: testActivityLease("workspace-a"),
 });
 assert.equal(background.running, true);
 assert.ok(background.sessionId);
 assert.equal(typeof background.sessionId, "number");
-assert.equal(manager.hasRunningSessions("workspace-a"), true);
-assert.equal(manager.hasRunningSessions("workspace-b"), false);
-assert.throws(
-  () => manager.beginWorkspaceClose("workspace-a"),
-  /has running processes/,
-);
-manager.beginShellCommand("workspace-shell");
-assert.throws(
-  () => manager.beginWorkspaceClose("workspace-shell"),
-  /has running processes/,
-);
-manager.endShellCommand("workspace-shell");
-manager.beginWorkspaceClose("workspace-b");
-assert.throws(
-  () => manager.beginWorkspaceClose("workspace-b"),
-  /already being closed/,
-);
-await assert.rejects(
-  manager.start({
-    workspaceId: "workspace-b",
-    command: "printf blocked",
-    cwd: process.cwd(),
-  }),
-  /being closed and cannot start a process/,
-);
-assert.throws(
-  () => manager.beginShellCommand("workspace-b"),
-  /being closed and cannot start a shell command/,
-);
-manager.endWorkspaceClose("workspace-b");
 
 await assert.rejects(
   manager.write({
@@ -115,7 +107,6 @@ const completed = await manager.write({
 assert.equal(completed.running, false);
 assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
-assert.equal(manager.hasRunningSessions("workspace-a"), false);
 
 const interactive = await manager.start({
   workspaceId: "workspace-a",
@@ -242,7 +233,49 @@ try {
     });
     assert.equal(resizedPty.running, false);
     assert.match(resizedPty.output, /columns:120/);
+
+    let shutdownLeaseReleased = false;
+    const shutdownProcess = await manager.start({
+      workspaceId: "workspace-shutdown",
+      cwd: process.cwd(),
+      command: `exec ${node} -e "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200)); console.log('shutdown-ready'); setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 100,
+      activityLease: {
+        id: "lease-workspace-shutdown",
+        workspaceId: "workspace-shutdown",
+        kind: "process",
+        heartbeatIntervalMs: 25,
+        heartbeat: () => undefined,
+        release: () => {
+          shutdownLeaseReleased = true;
+        },
+      },
+    });
+    assert.equal(shutdownProcess.running, true);
+    assert.match(shutdownProcess.output, /shutdown-ready/);
+
+    const shutdown = manager.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(shutdownLeaseReleased, false);
+    await shutdown;
+    assert.equal(shutdownLeaseReleased, true);
   }
 } finally {
-  manager.shutdown();
+  await manager.shutdown();
+}
+
+function testActivityLease(workspaceId: string): WorkspaceActivityLease {
+  let released = false;
+  return {
+    id: `lease-${workspaceId}`,
+    workspaceId,
+    kind: "process",
+    heartbeatIntervalMs: 25,
+    heartbeat: () => {
+      assert.equal(released, false);
+    },
+    release: () => {
+      released = true;
+    },
+  };
 }

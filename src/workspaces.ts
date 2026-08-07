@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import type { Stats } from "node:fs";
+import { realpathSync, statSync, type Stats } from "node:fs";
+import { execFileSync } from "node:child_process";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -7,10 +8,11 @@ import type {
   WorkspaceStatus,
   WorkspaceStore,
 } from "./workspace-store.js";
-import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
+import { git } from "./git.js";
 import {
   createManagedWorktree,
   inspectManagedWorktree,
@@ -92,6 +94,10 @@ export interface CloseWorkspaceOptions {
   discardChanges?: boolean;
 }
 
+export interface WorkspaceRegistryOptions {
+  removeManagedWorktree?: typeof removeManagedWorktree;
+}
+
 export interface CloseWorkspaceResult {
   workspaceId: string;
   root: string;
@@ -102,6 +108,7 @@ export interface CloseWorkspaceResult {
 }
 
 type PathStats = Stats;
+class RestoredWorkspaceRejectedError extends Error {}
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
   mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
@@ -110,11 +117,16 @@ type DirectoryOps = {
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly removeManagedWorktreeOperation: typeof removeManagedWorktree;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
-  ) {}
+    options: WorkspaceRegistryOptions = {},
+  ) {
+    this.removeManagedWorktreeOperation =
+      options.removeManagedWorktree ?? removeManagedWorktree;
+  }
 
   async openWorkspace(
     input: string | OpenWorkspaceInput,
@@ -235,6 +247,7 @@ export class WorkspaceRegistry {
         return undefined;
       }
     } catch (error) {
+      if (error instanceof RestoredWorkspaceRejectedError) throw error;
       if (
         error instanceof AccessDeniedError ||
         (isErrnoException(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
@@ -410,6 +423,7 @@ export class WorkspaceRegistry {
         throw new Error(`Workspace ${workspaceId} is ${session.status}.${reason}`);
       }
       if (session?.status === "detached" || session?.status === "cleanup_failed") {
+        this.validateRestoredWorkspaceSession(session);
         this.store?.setSessionStatus(workspaceId, "open");
       } else {
         this.store?.touchSession(workspaceId);
@@ -426,7 +440,7 @@ export class WorkspaceRegistry {
       throw new Error(`Workspace ${workspaceId} is ${session.status}.${reason}`);
     }
 
-    const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    const root = this.validateRestoredWorkspaceSession(session);
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
@@ -455,6 +469,101 @@ export class WorkspaceRegistry {
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  private validateRestoredWorkspaceSession(session: WorkspaceSession): string {
+    let root: string;
+    try {
+      root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+      if (!statSync(root).isDirectory()) {
+        return this.rejectRestoredWorkspace(
+          session,
+          "orphaned",
+          "Workspace path no longer exists or is not a directory.",
+        );
+      }
+    } catch (error) {
+      if (
+        error instanceof AccessDeniedError ||
+        (isErrnoException(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+      ) {
+        return this.rejectRestoredWorkspace(
+          session,
+          error instanceof AccessDeniedError ? "cleanup_failed" : "orphaned",
+          error instanceof AccessDeniedError
+            ? `Workspace path is no longer inside an allowed root: ${session.root}`
+            : "Workspace path no longer exists or is not a directory.",
+        );
+      }
+      throw error;
+    }
+
+    if (session.mode !== "worktree" || !session.managed) return root;
+    if (!session.sourceRoot) {
+      return this.rejectRestoredWorkspace(
+        session,
+        "cleanup_failed",
+        "Managed worktree is missing its source checkout path.",
+      );
+    }
+
+    try {
+      if (!statSync(session.sourceRoot).isDirectory()) {
+        return this.rejectRestoredWorkspace(
+          session,
+          "cleanup_failed",
+          "Managed worktree source checkout no longer exists.",
+        );
+      }
+      const output = execFileSync(
+        "git",
+        ["worktree", "list", "--porcelain", "-z"],
+        { cwd: session.sourceRoot, encoding: "utf8" },
+      );
+      const restoredRoot = realpathSync(root);
+      const registered = output
+        .split("\0")
+        .filter((field) => field.startsWith("worktree "))
+        .map((field) => field.slice("worktree ".length))
+        .some((path) => {
+          try {
+            return realpathSync(path) === restoredRoot;
+          } catch {
+            return false;
+          }
+        });
+      if (!registered) {
+        return this.rejectRestoredWorkspace(
+          session,
+          "cleanup_failed",
+          "Managed worktree path exists but is not registered with Git.",
+        );
+      }
+    } catch (error) {
+      if (error instanceof RestoredWorkspaceRejectedError) throw error;
+      return this.rejectRestoredWorkspace(
+        session,
+        "cleanup_failed",
+        `Could not validate managed worktree registration: ${errorMessage(error)}`,
+      );
+    }
+
+    return root;
+  }
+
+  private rejectRestoredWorkspace(
+    session: WorkspaceSession,
+    status: Extract<WorkspaceStatus, "orphaned" | "cleanup_failed">,
+    reason: string,
+  ): never {
+    this.store?.setSessionStatus(session.id, status, reason);
+    if (status === "orphaned") {
+      this.store?.deleteConversationBindingsForSession(session.id);
+    }
+    this.workspaces.delete(session.id);
+    throw new RestoredWorkspaceRejectedError(
+      `Workspace ${session.id} is ${status}. ${reason}`,
+    );
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
@@ -516,12 +625,51 @@ export class WorkspaceRegistry {
       config: this.config,
     });
 
-    return this.createWorkspaceContext({
-      root: worktree.path,
-      mode: "worktree",
-      sourceRoot: worktree.sourceRoot,
-      worktree,
-    });
+    try {
+      return await this.createWorkspaceContext({
+        root: worktree.path,
+        mode: "worktree",
+        sourceRoot: worktree.sourceRoot,
+        worktree,
+      });
+    } catch (error) {
+      try {
+        await this.removeManagedWorktreeOperation({
+          sourceRoot: worktree.sourceRoot,
+          worktreePath: worktree.path,
+          discardChanges: true,
+          config: this.config,
+        });
+      } catch (cleanupError) {
+        const statusReason = [
+          `Workspace initialization failed: ${errorMessage(error)}`,
+          `Managed worktree removal failed: ${errorMessage(cleanupError)}`,
+        ].join(" ");
+        let cleanupRecordError: unknown;
+        try {
+          this.store?.createSession({
+            id: `ws_${randomBytes(5).toString("hex")}`,
+            root: worktree.path,
+            mode: "worktree",
+            sourceRoot: worktree.sourceRoot,
+            baseRef: worktree.baseRef,
+            baseSha: worktree.baseSha,
+            managed: true,
+            status: "cleanup_failed",
+            statusReason,
+          });
+        } catch (recordError) {
+          cleanupRecordError = recordError;
+        }
+        const failures = [error, cleanupError];
+        if (cleanupRecordError !== undefined) failures.push(cleanupRecordError);
+        throw new AggregateError(
+          failures,
+          `Workspace initialization failed and the managed worktree could not be removed: ${worktree.path}`,
+        );
+      }
+      throw error;
+    }
   }
 
   private async createWorkspaceContext(input: {
@@ -530,14 +678,18 @@ export class WorkspaceRegistry {
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
   }): Promise<WorkspaceContext> {
+    const loadedSkills = this.loadSkillsForWorkspace(input.root);
+    const agentProfiles = await loadLocalAgentProfiles(this.config, input.root);
+    const agentsFiles = await this.loadInitialAgentsFiles(input.root);
+    const availableAgentsFiles = await this.findAvailableAgentsFiles(input.root, agentsFiles);
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
-      ...this.loadSkillsForWorkspace(input.root),
-      agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
+      ...loadedSkills,
+      agentProfiles,
       activatedSkillDirs: new Set(),
     };
 
@@ -551,8 +703,6 @@ export class WorkspaceRegistry {
       managed: workspace.worktree?.managed,
     });
     this.workspaces.set(workspace.id, workspace);
-    const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
     return {
       workspace,
@@ -619,6 +769,67 @@ export class WorkspaceRegistry {
       const realPath = await tryRealpath(file.path);
       if (realPath) loadedRealPaths.add(realPath);
     }
+
+    if (await isGitWorkspace(root)) {
+      return this.findAvailableAgentsFilesFromGit(root, loadedPaths, loadedRealPaths);
+    }
+
+    return this.findAvailableAgentsFilesByWalking(root, loadedPaths, loadedRealPaths);
+  }
+
+  private async findAvailableAgentsFilesFromGit(
+    root: string,
+    loadedPaths: Set<string>,
+    loadedRealPaths: Set<string>,
+  ): Promise<AvailableAgentsFile[]> {
+    const output = (
+      await git(root, [
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--no-directory",
+        "--",
+        ...CONTEXT_FILE_PATHS,
+      ])
+    ).stdout;
+    const resolvedRoot = (await tryRealpath(root)) ?? root;
+    const candidates = await Promise.all(
+      output
+        .split("\0")
+        .filter(Boolean)
+        .map(async (relativePath): Promise<{ path: string; realPath: string } | undefined> => {
+          const path = resolve(root, relativePath);
+          const pathStats = await tryLstat(path);
+          if (!pathStats?.isFile()) return undefined;
+
+          const realPath = await tryRealpath(path);
+          if (!realPath || !isPathInsideRoot(realPath, resolvedRoot)) return undefined;
+          return { path, realPath };
+        }),
+    );
+    const discoveredPaths = new Set<string>();
+    const discovered: AvailableAgentsFile[] = [];
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (loadedPaths.has(candidate.path)) continue;
+      if (loadedRealPaths.has(candidate.realPath)) continue;
+      if (discoveredPaths.has(candidate.path)) continue;
+
+      discovered.push({ path: candidate.path });
+      discoveredPaths.add(candidate.path);
+    }
+
+    return discovered.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  private async findAvailableAgentsFilesByWalking(
+    root: string,
+    loadedPaths: Set<string>,
+    loadedRealPaths: Set<string>,
+  ): Promise<AvailableAgentsFile[]> {
     const discovered: AvailableAgentsFile[] = [];
 
     await walkWorkspace(root, async (path, entry) => {
@@ -695,6 +906,7 @@ export async function ensureCheckoutWorkspaceRoot(
 }
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
+const CONTEXT_FILE_PATHS = Array.from(CONTEXT_FILE_NAMES, (name) => `:(glob)**/${name}`);
 const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",
@@ -749,6 +961,23 @@ async function tryRealpath(path: string): Promise<string | undefined> {
     return await realpath(path);
   } catch {
     return undefined;
+  }
+}
+
+async function tryLstat(path: string): Promise<Stats | undefined> {
+  try {
+    return await lstat(path);
+  } catch {
+    return undefined;
+  }
+}
+
+async function isGitWorkspace(path: string): Promise<boolean> {
+  try {
+    await git(path, ["rev-parse", "--show-toplevel"]);
+    return true;
+  } catch {
+    return false;
   }
 }
 
