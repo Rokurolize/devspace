@@ -2077,7 +2077,7 @@ export function createServer(
         clearInterval(sessionCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
-        processSessions.shutdown();
+        await processSessions.shutdown();
         workspaces.detachAll();
         workspaceActivity.close();
         oauthProvider.close();

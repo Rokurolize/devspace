@@ -13,6 +13,7 @@ const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const PROCESS_SHUTDOWN_GRACE_MS = 3_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
@@ -292,13 +293,44 @@ export class ProcessSessionManager {
     if (session.running) session.process?.kill("SIGTERM");
   }
 
-  shutdown(): void {
-    for (const session of this.sessions.values()) {
+  async shutdown(): Promise<void> {
+    const sessions = Array.from(this.sessions.values());
+    for (const session of sessions) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.running) session.process?.kill("SIGTERM");
-      this.releaseActivity(session);
+    }
+
+    await this.waitForSessions(sessions, PROCESS_SHUTDOWN_GRACE_MS);
+    const remaining = sessions.filter((session) => session.running);
+    for (const session of remaining) session.process?.kill("SIGKILL");
+    await this.waitForSessions(remaining, PROCESS_SHUTDOWN_GRACE_MS);
+
+    for (const session of sessions) {
+      if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+      if (session.running) this.abandonActivity(session);
+      else this.releaseActivity(session);
     }
     this.sessions.clear();
+  }
+
+  private async waitForSessions(
+    sessions: ProcessSession[],
+    timeoutMs: number,
+  ): Promise<void> {
+    const running = sessions.filter((session) => session.running);
+    if (running.length === 0) return;
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.all(running.map((session) => session.exitPromise)),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
@@ -450,6 +482,14 @@ export class ProcessSessionManager {
     session.stopActivityHeartbeat?.();
     session.stopActivityHeartbeat = undefined;
     session.activityLease?.release();
+    session.activityLease = undefined;
+  }
+
+  private abandonActivity(session: ProcessSession): void {
+    session.stopActivityHeartbeat?.();
+    session.stopActivityHeartbeat = undefined;
+    // Keep the lease row until its expiry. If a process survives SIGKILL, a
+    // restarted server must not immediately treat its workspace as idle.
     session.activityLease = undefined;
   }
 }

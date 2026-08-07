@@ -213,9 +213,35 @@ try {
     });
     assert.equal(resizedPty.running, false);
     assert.match(resizedPty.output, /columns:120/);
+
+    let shutdownLeaseReleased = false;
+    const shutdownProcess = await manager.start({
+      workspaceId: "workspace-shutdown",
+      cwd: process.cwd(),
+      command: `exec ${node} -e "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200)); console.log('shutdown-ready'); setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 100,
+      activityLease: {
+        id: "lease-workspace-shutdown",
+        workspaceId: "workspace-shutdown",
+        kind: "process",
+        heartbeatIntervalMs: 25,
+        heartbeat: () => undefined,
+        release: () => {
+          shutdownLeaseReleased = true;
+        },
+      },
+    });
+    assert.equal(shutdownProcess.running, true);
+    assert.match(shutdownProcess.output, /shutdown-ready/);
+
+    const shutdown = manager.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(shutdownLeaseReleased, false);
+    await shutdown;
+    assert.equal(shutdownLeaseReleased, true);
   }
 } finally {
-  manager.shutdown();
+  await manager.shutdown();
 }
 
 function testActivityLease(workspaceId: string): WorkspaceActivityLease {
