@@ -9,12 +9,14 @@ import {
   applyWorkspaceReconcile,
   inspectWorkspaceSessions,
 } from "./workspace-reconcile.js";
+import { WorkspaceActivityStore, WorkspaceBusyError } from "./workspace-activity.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-reconcile-test-"));
 const store = new SqliteWorkspaceStore(join(root, ".state"));
+const workspaceActivity = new WorkspaceActivityStore(join(root, ".state"));
 
 try {
   const config = loadConfig({
@@ -82,7 +84,24 @@ try {
   assert.equal(unregisteredEntry?.pathExists, true);
   assert.equal(unregisteredEntry?.registered, false);
 
-  await applyWorkspaceReconcile(config, store, [
+  const activeLease = workspaceActivity.acquireShared(
+    cleanWorktree.workspace.id,
+    "operation",
+    "test-operation",
+  );
+  await assert.rejects(
+    applyWorkspaceReconcile(config, store, workspaceActivity, [
+      missingCheckout.workspace.id,
+      cleanWorktree.workspace.id,
+      unregisteredWorktree.workspace.id,
+    ]),
+    (error: unknown) => error instanceof WorkspaceBusyError,
+  );
+  assert.equal(store.getSession(missingCheckout.workspace.id)?.status, "detached");
+  assert.equal((await stat(cleanWorktree.workspace.root)).isDirectory(), true);
+  activeLease.release();
+
+  await applyWorkspaceReconcile(config, store, workspaceActivity, [
     missingCheckout.workspace.id,
     cleanWorktree.workspace.id,
     unregisteredWorktree.workspace.id,
@@ -104,6 +123,7 @@ try {
   assert.equal((await stat(unregisteredWorktree.workspace.root)).isDirectory(), true);
   assert.equal((await stat(untrackedWorktreeDirectory)).isDirectory(), true);
 } finally {
+  workspaceActivity.close();
   store.close();
   await rm(root, { recursive: true, force: true });
 }

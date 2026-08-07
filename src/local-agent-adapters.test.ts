@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { delimiter } from "node:path";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import {
   claudeCommandEnvironment,
   createLocalAgentAdapter,
@@ -8,6 +10,7 @@ import {
   extractPiProviderError,
   extractPiStreamingText,
   piCommandEnvironment,
+  runLocalAgentProvider,
   resolveAcpModelConfigUpdate,
   resolveAcpThinkingConfigUpdate,
 } from "./local-agent-adapters.js";
@@ -387,4 +390,53 @@ assert.equal(
   });
 
   assert.equal(env.PATH, [devspaceBin, "/home/user/.local/bin"].join(delimiter));
+}
+
+if (process.platform !== "win32") {
+  const root = await mkdtemp(join(tmpdir(), "devspace-pi-exit-test-"));
+  const command = join(root, "fake-pi.mjs");
+  const previousPiCommand = process.env.PI_COMMAND;
+  try {
+    await writeFile(
+      command,
+      [
+        "#!/usr/bin/env node",
+        'import readline from "node:readline";',
+        'if (process.argv.includes("--version")) process.exit(0);',
+        'const lines = readline.createInterface({ input: process.stdin });',
+        'for await (const line of lines) {',
+        '  const request = JSON.parse(line);',
+        '  if (request.type === "get_state") {',
+        '    console.log(JSON.stringify({ type: "response", id: request.id, success: true, data: { sessionId: "fake" } }));',
+        '  } else if (request.type === "prompt") {',
+        '    console.log(JSON.stringify({ type: "response", id: request.id, success: true, data: {} }));',
+        '    setTimeout(() => process.exit(7), 25);',
+        '  }',
+        '}',
+        "",
+      ].join("\n"),
+    );
+    await chmod(command, 0o700);
+    process.env.PI_COMMAND = command;
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      Promise.race([
+        runLocalAgentProvider("pi", {
+          prompt: "fail after prompt",
+          workspace: root,
+          writeMode: "allowed",
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("Pi exit was not propagated")), 2_000).unref();
+        }),
+      ]),
+      /Pi RPC process exited with code 7/,
+    );
+    assert.ok(Date.now() - startedAt < 2_000);
+  } finally {
+    if (previousPiCommand === undefined) delete process.env.PI_COMMAND;
+    else process.env.PI_COMMAND = previousPiCommand;
+    await rm(root, { recursive: true, force: true });
+  }
 }

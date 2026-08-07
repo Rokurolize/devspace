@@ -57,6 +57,25 @@ export const workspaceConversationBindings = sqliteTable(
   ],
 );
 
+export const workspaceActivityLeases = sqliteTable(
+  "workspace_activity_leases",
+  {
+    leaseId: text("lease_id").primaryKey(),
+    workspaceId: text("workspace_id").notNull(),
+    kind: text("kind").notNull(),
+    ownerId: text("owner_id").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("workspace_activity_leases_workspace_expires_idx").on(
+      table.workspaceId,
+      table.expiresAt,
+    ),
+  ],
+);
+
 export const oauthClients = sqliteTable(
   "oauth_clients",
   {

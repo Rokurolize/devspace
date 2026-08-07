@@ -68,6 +68,8 @@ function testOneToolContract(): void {
       logging: { toolCalls: false },
     } as never,
     workspaces: {} as never,
+    workspaceActivity: {} as never,
+    activityOwnerPrefix: "test",
   });
 
   assert.deepEqual([...registered.keys()], ["download_artifact"]);

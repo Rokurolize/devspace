@@ -32,6 +32,11 @@ const migrations: Migration[] = [
     name: "workspace-lifecycle",
     up: migrateWorkspaceLifecycle,
   },
+  {
+    version: 6,
+    name: "workspace-activity-leases",
+    up: migrateWorkspaceActivityLeases,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -210,6 +215,23 @@ function migrateWorkspaceLifecycle(sqlite: Database.Database): void {
     update workspace_sessions
     set status = 'detached', status_reason = null
     where status in ('active', 'open');
+  `);
+}
+
+function migrateWorkspaceActivityLeases(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_activity_leases (
+      lease_id text primary key,
+      workspace_id text not null,
+      kind text not null,
+      owner_id text not null,
+      expires_at integer not null,
+      created_at text not null,
+      updated_at text not null
+    );
+
+    create index if not exists workspace_activity_leases_workspace_expires_idx
+      on workspace_activity_leases(workspace_id, expires_at);
   `);
 }
 

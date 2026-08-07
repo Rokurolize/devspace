@@ -6,6 +6,11 @@ import type {
   WorkspaceStatus,
   WorkspaceStore,
 } from "./workspace-store.js";
+import type {
+  WorkspaceActivityLease,
+  WorkspaceActivityStore,
+} from "./workspace-activity.js";
+import { startWorkspaceActivityHeartbeat } from "./workspace-activity.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 export type WorkspaceReconcileAction =
@@ -42,32 +47,53 @@ export async function inspectWorkspaceSessions(
 export async function applyWorkspaceReconcile(
   config: ServerConfig,
   store: WorkspaceStore,
+  workspaceActivity: WorkspaceActivityStore,
   workspaceIds: string[],
 ): Promise<WorkspaceReconcileEntry[]> {
-  const selectedIds = new Set(workspaceIds);
-  const entries = await inspectWorkspaceSessions(config, store);
+  const selectedIds = Array.from(new Set(workspaceIds));
+  const leases: WorkspaceActivityLease[] = [];
+  const stopHeartbeats: Array<() => void> = [];
   const registry = new WorkspaceRegistry(config, store);
-
-  for (const entry of entries) {
-    if (!selectedIds.has(entry.workspaceId)) continue;
-
-    switch (entry.action) {
-      case "mark_orphaned":
-        store.setSessionStatus(entry.workspaceId, "orphaned", entry.reason);
-        store.deleteConversationBindingsForSession(entry.workspaceId);
-        break;
-      case "mark_cleanup_failed":
-        store.setSessionStatus(entry.workspaceId, "cleanup_failed", entry.reason);
-        break;
-      case "remove_worktree":
-        await registry.closeWorkspace(entry.workspaceId);
-        break;
-      case "none":
-        break;
+  try {
+    for (const workspaceId of selectedIds) {
+      const lease = workspaceActivity.acquireClose(workspaceId, `prune:${process.pid}`);
+      leases.push(lease);
+      stopHeartbeats.push(startWorkspaceActivityHeartbeat(lease));
     }
-  }
 
-  return inspectWorkspaceSessions(config, store);
+    const entries: WorkspaceReconcileEntry[] = [];
+    for (const workspaceId of selectedIds) {
+      const session = store.getSession(workspaceId);
+      if (!session) throw new Error(`Unknown workspace ID: ${workspaceId}`);
+      const entry = await inspectWorkspaceSession(config, store, session);
+      if (entry.action === "none") {
+        throw new Error(`Workspace is no longer a cleanup candidate: ${workspaceId}`);
+      }
+      entries.push(entry);
+    }
+
+    for (const entry of entries) {
+      switch (entry.action) {
+        case "mark_orphaned":
+          store.setSessionStatus(entry.workspaceId, "orphaned", entry.reason);
+          store.deleteConversationBindingsForSession(entry.workspaceId);
+          break;
+        case "mark_cleanup_failed":
+          store.setSessionStatus(entry.workspaceId, "cleanup_failed", entry.reason);
+          break;
+        case "remove_worktree":
+          await registry.closeWorkspace(entry.workspaceId);
+          break;
+        case "none":
+          break;
+      }
+    }
+
+    return entries;
+  } finally {
+    for (const stopHeartbeat of stopHeartbeats.reverse()) stopHeartbeat();
+    for (const lease of leases.reverse()) lease.release();
+  }
 }
 
 async function inspectWorkspaceSession(
