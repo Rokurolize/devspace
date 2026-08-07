@@ -94,6 +94,10 @@ export interface CloseWorkspaceOptions {
   discardChanges?: boolean;
 }
 
+export interface WorkspaceRegistryOptions {
+  removeManagedWorktree?: typeof removeManagedWorktree;
+}
+
 export interface CloseWorkspaceResult {
   workspaceId: string;
   root: string;
@@ -113,11 +117,16 @@ type DirectoryOps = {
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly removeManagedWorktreeOperation: typeof removeManagedWorktree;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
-  ) {}
+    options: WorkspaceRegistryOptions = {},
+  ) {
+    this.removeManagedWorktreeOperation =
+      options.removeManagedWorktree ?? removeManagedWorktree;
+  }
 
   async openWorkspace(
     input: string | OpenWorkspaceInput,
@@ -625,15 +634,37 @@ export class WorkspaceRegistry {
       });
     } catch (error) {
       try {
-        await removeManagedWorktree({
+        await this.removeManagedWorktreeOperation({
           sourceRoot: worktree.sourceRoot,
           worktreePath: worktree.path,
           discardChanges: true,
           config: this.config,
         });
       } catch (cleanupError) {
+        const statusReason = [
+          `Workspace initialization failed: ${errorMessage(error)}`,
+          `Managed worktree removal failed: ${errorMessage(cleanupError)}`,
+        ].join(" ");
+        let cleanupRecordError: unknown;
+        try {
+          this.store?.createSession({
+            id: `ws_${randomBytes(5).toString("hex")}`,
+            root: worktree.path,
+            mode: "worktree",
+            sourceRoot: worktree.sourceRoot,
+            baseRef: worktree.baseRef,
+            baseSha: worktree.baseSha,
+            managed: true,
+            status: "cleanup_failed",
+            statusReason,
+          });
+        } catch (recordError) {
+          cleanupRecordError = recordError;
+        }
+        const failures = [error, cleanupError];
+        if (cleanupRecordError !== undefined) failures.push(cleanupRecordError);
         throw new AggregateError(
-          [error, cleanupError],
+          failures,
           `Workspace initialization failed and the managed worktree could not be removed: ${worktree.path}`,
         );
       }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -101,16 +101,15 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
   assert.equal(resolvedReadme.startsWith(opened.workspace.root), true);
 });
 
-test("failed worktree context initialization removes the managed worktree", { skip: platform() === "win32" }, async (t) => {
+test("failed worktree context initialization removes the managed worktree", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
   const configDir = join(context.root, ".failing-devspace");
   const agentsDir = join(configDir, "agents");
   const worktreeRoot = join(context.root, ".failing-worktrees");
   const stateDir = join(context.root, ".failing-state");
-  await mkdir(agentsDir, { recursive: true });
-  await writeFile(join(agentsDir, "blocked.md"), "blocked\n");
-  await chmod(agentsDir, 0o000);
+  await mkdir(configDir, { recursive: true });
+  await writeFile(agentsDir, "not a directory\n");
 
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,
@@ -126,28 +125,75 @@ test("failed worktree context initialization removes the managed worktree", { sk
   const registry = new WorkspaceRegistry(config, store);
   t.after(() => store.close());
 
+  await assert.rejects(
+    () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    /not a directory|ENOTDIR/i,
+  );
+  assert.deepEqual(await readdir(worktreeRoot), []);
+  assert.equal(store.listSessions().length, 0);
+
+  const worktreeList = await execFileAsync(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    { cwd: gitRoot, encoding: "utf8" },
+  );
+  assert.deepEqual(
+    worktreeList.stdout
+      .split("\0")
+      .filter((field) => field.startsWith("worktree "))
+      .map((field) => field.slice("worktree ".length)),
+    [gitRoot],
+  );
+});
+
+test("failed worktree compensation persists a cleanup record", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const configDir = join(context.root, ".cleanup-failure-devspace");
+  const agentsPath = join(configDir, "agents");
+  const worktreeRoot = join(context.root, ".cleanup-failure-worktrees");
+  const stateDir = join(context.root, ".cleanup-failure-state");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(agentsPath, "not a directory\n");
+
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_ALLOWED_ROOTS: context.root,
+    DEVSPACE_WORKTREE_ROOT: worktreeRoot,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_AGENT_DIR: context.agentDir,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const store = new SqliteWorkspaceStore(stateDir);
+  const registry = new WorkspaceRegistry(config, store, {
+    removeManagedWorktree: async () => {
+      throw new Error("simulated cleanup failure");
+    },
+  });
+
+  let leakedWorktree: string | undefined;
   try {
     await assert.rejects(
       () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
-      /permission denied|EACCES/i,
+      (error: unknown) => error instanceof AggregateError,
     );
-    assert.deepEqual(await readdir(worktreeRoot), []);
-    assert.equal(store.listSessions().length, 0);
-
-    const worktreeList = await execFileAsync(
-      "git",
-      ["worktree", "list", "--porcelain", "-z"],
-      { cwd: gitRoot, encoding: "utf8" },
-    );
-    assert.deepEqual(
-      worktreeList.stdout
-        .split("\0")
-        .filter((field) => field.startsWith("worktree "))
-        .map((field) => field.slice("worktree ".length)),
-      [gitRoot],
-    );
+    const sessions = store.listSessions();
+    assert.equal(sessions.length, 1);
+    const [session] = sessions;
+    assert.ok(session);
+    leakedWorktree = session.root;
+    assert.equal(session.mode, "worktree");
+    assert.equal(session.managed, true);
+    assert.equal(session.status, "cleanup_failed");
+    assert.match(session.statusReason ?? "", /simulated cleanup failure/);
+    assert.equal((await stat(session.root)).isDirectory(), true);
   } finally {
-    await chmod(agentsDir, 0o700).catch(() => undefined);
+    if (leakedWorktree) {
+      await git(gitRoot, ["worktree", "remove", "--force", leakedWorktree]);
+    }
+    store.close();
   }
 });
 
