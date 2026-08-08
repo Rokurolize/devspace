@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, rm, symlink, unlink } from "node:fs/promises";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
+import { databasePath, openDatabase } from "./db/client.js";
 import {
   startWorkspaceActivityHeartbeat,
   WorkspaceActivityStore,
   WorkspaceBusyError,
 } from "./workspace-activity.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 test("workspace activity leases coordinate across database connections", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-test-"));
@@ -35,6 +38,224 @@ test("workspace activity leases coordinate across database connections", async (
   } finally {
     first.close();
     second.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace aliases for the same root share one activity boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-alias-test-"));
+  const stateDir = join(root, ".state");
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+  const sessions = new SqliteWorkspaceStore(stateDir);
+  sessions.createSession({
+    id: "ws_managed_alias",
+    root: workspaceRoot,
+    mode: "worktree",
+    sourceRoot: root,
+    managed: true,
+  });
+  sessions.createSession({
+    id: "ws_checkout_alias",
+    root: workspaceRoot,
+    mode: "checkout",
+  });
+  const first = new WorkspaceActivityStore(stateDir);
+  const second = new WorkspaceActivityStore(stateDir);
+  try {
+    const checkoutClose = second.acquireClose(
+      "ws_checkout_alias",
+      "checkout-handle-close",
+    );
+    checkoutClose.release();
+
+    assert.throws(
+      () => second.acquireClose("ws_managed_alias", "open-alias-close"),
+      (error: unknown) =>
+        error instanceof WorkspaceBusyError && error.reason === "open_alias",
+    );
+    sessions.setSessionStatus("ws_checkout_alias", "detached");
+
+    const operation = first.acquireShared(
+      "ws_checkout_alias",
+      "operation",
+      "alias-operation",
+    );
+    assert.throws(
+      () => second.acquireClose("ws_managed_alias", "alias-close"),
+      (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "active",
+    );
+    operation.release();
+
+    const close = second.acquireClose("ws_managed_alias", "alias-close");
+    assert.throws(
+      () => first.acquireShared("ws_checkout_alias", "operation", "blocked-alias"),
+      (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "closing",
+    );
+    close.release();
+  } finally {
+    first.close();
+    second.close();
+    sessions.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "symlinked workspace aliases share one activity boundary",
+  { skip: platform() === "win32" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-symlink-test-"));
+    const stateDir = join(root, ".state");
+    const workspaceRoot = join(root, "workspace");
+    const workspaceAlias = join(root, "workspace-alias");
+    await mkdir(workspaceRoot);
+    await symlink(workspaceRoot, workspaceAlias, "dir");
+    const sessions = new SqliteWorkspaceStore(stateDir);
+    sessions.createSession({ id: "ws_real", root: workspaceRoot, mode: "checkout" });
+    sessions.createSession({ id: "ws_symlink", root: workspaceAlias, mode: "checkout" });
+    sessions.setSessionStatus("ws_real", "detached");
+    const first = new WorkspaceActivityStore(stateDir);
+    const second = new WorkspaceActivityStore(stateDir);
+    try {
+      const operation = first.acquireShared("ws_real", "operation", "real-operation");
+      assert.throws(
+        () => second.acquireClose("ws_symlink", "symlink-close"),
+        (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "active",
+      );
+      operation.release();
+    } finally {
+      first.close();
+      second.close();
+      sessions.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "adopting a lease preserves its original symlink target identity",
+  { skip: platform() === "win32" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-retarget-test-"));
+    const stateDir = join(root, ".state");
+    const originalRoot = join(root, "original");
+    const replacementRoot = join(root, "replacement");
+    const workspaceAlias = join(root, "workspace-alias");
+    await mkdir(originalRoot);
+    await mkdir(replacementRoot);
+    await symlink(originalRoot, workspaceAlias, "dir");
+
+    const sessions = new SqliteWorkspaceStore(stateDir);
+    sessions.createSession({
+      id: "ws_original_target",
+      root: originalRoot,
+      mode: "worktree",
+      sourceRoot: root,
+      managed: true,
+    });
+    sessions.createSession({ id: "ws_retargeted_alias", root: workspaceAlias, mode: "checkout" });
+    sessions.setSessionStatus("ws_original_target", "detached");
+    sessions.setSessionStatus("ws_retargeted_alias", "detached");
+
+    const first = new WorkspaceActivityStore(stateDir);
+    const second = new WorkspaceActivityStore(stateDir);
+    try {
+      const original = first.acquireShared(
+        "ws_retargeted_alias",
+        "local_agent",
+        "retarget-agent",
+      );
+      await unlink(workspaceAlias);
+      await symlink(replacementRoot, workspaceAlias, "dir");
+
+      const adopted = second.adopt(
+        original.id,
+        "ws_retargeted_alias",
+        "local_agent",
+      );
+      assert.throws(
+        () => first.acquireClose("ws_original_target", "original-target-close"),
+        (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "active",
+      );
+      adopted.release();
+      original.release();
+    } finally {
+      first.close();
+      second.close();
+      sessions.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("resource migration backfills existing workspace leases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-migration-test-"));
+  const stateDir = join(root, ".state");
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+
+  const sessions = new SqliteWorkspaceStore(stateDir);
+  sessions.createSession({ id: "ws_pre_resource", root: workspaceRoot, mode: "checkout" });
+  sessions.createSession({ id: "ws_post_resource", root: workspaceRoot, mode: "checkout" });
+  sessions.setSessionStatus("ws_pre_resource", "detached");
+  sessions.setSessionStatus("ws_post_resource", "detached");
+  sessions.close();
+
+  const original = new WorkspaceActivityStore(stateDir);
+  original.acquireShared("ws_pre_resource", "operation", "pre-resource-operation");
+  original.close();
+  downgradeWorkspaceActivityTableToV6(stateDir);
+
+  const migrated = new WorkspaceActivityStore(stateDir);
+  try {
+    assert.throws(
+      () => migrated.acquireClose("ws_post_resource", "post-resource-close"),
+      (error: unknown) => error instanceof WorkspaceBusyError && error.reason === "active",
+    );
+  } finally {
+    migrated.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resource migration fences legacy lease writers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-workspace-activity-legacy-writer-test-"));
+  const stateDir = join(root, ".state");
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+
+  const sessions = new SqliteWorkspaceStore(stateDir);
+  sessions.createSession({ id: "ws_legacy_writer", root: workspaceRoot, mode: "checkout" });
+  sessions.setSessionStatus("ws_legacy_writer", "detached");
+  sessions.close();
+
+  const now = Date.now();
+  downgradeWorkspaceActivityTableToV6(stateDir);
+  const legacyDatabase = new Database(databasePath(stateDir));
+  const legacyInsert = legacyDatabase.prepare(
+    `insert into workspace_activity_leases (
+       lease_id, workspace_id, kind, owner_id, expires_at,
+       created_at, updated_at
+     ) values (?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const current = new WorkspaceActivityStore(stateDir);
+  try {
+    assert.throws(
+      () => legacyInsert.run(
+        "wal_legacy_writer",
+        "ws_legacy_writer",
+        "process",
+        "legacy-process",
+        now + 60_000,
+        new Date(now).toISOString(),
+        new Date(now).toISOString(),
+      ),
+      /resource_key|not null/i,
+    );
+  } finally {
+    current.close();
+    legacyDatabase.close();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -126,3 +347,38 @@ test("workspace activity release remains safe after its store becomes unavailabl
   assert.doesNotThrow(() => lease.release());
   await rm(root, { recursive: true, force: true });
 });
+
+function downgradeWorkspaceActivityTableToV6(stateDir: string): void {
+  const database = new Database(databasePath(stateDir));
+  try {
+    database.exec(`
+      create table workspace_activity_leases_v6 (
+        lease_id text primary key,
+        workspace_id text not null,
+        kind text not null,
+        owner_id text not null,
+        expires_at integer not null,
+        created_at text not null,
+        updated_at text not null
+      );
+
+      insert into workspace_activity_leases_v6 (
+        lease_id, workspace_id, kind, owner_id,
+        expires_at, created_at, updated_at
+      )
+      select lease_id, workspace_id, kind, owner_id,
+             expires_at, created_at, updated_at
+      from workspace_activity_leases;
+
+      drop table workspace_activity_leases;
+      alter table workspace_activity_leases_v6 rename to workspace_activity_leases;
+
+      create index workspace_activity_leases_workspace_expires_idx
+        on workspace_activity_leases(workspace_id, expires_at);
+
+      delete from devspace_schema_migrations where version = 7;
+    `);
+  } finally {
+    database.close();
+  }
+}

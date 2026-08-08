@@ -197,10 +197,12 @@ Workspace rows use the finite statuses `detached`, `open`, `closed`,
 restoring them on use.
 
 Workspace-scoped tools, long-running processes, and local-agent workers hold
-expiring activity leases in SQLite. `close_workspace` and prune apply acquire an
-exclusive lease, so they refuse to remove or reclassify a workspace while those
-operations are active. Leases are refreshed while work continues and expire
-after an abnormal process exit.
+expiring activity leases in SQLite. Leases are keyed by the canonical workspace
+root rather than only by `workspaceId`, so separate handles for the same checkout
+or worktree share one activity boundary. `close_workspace` and prune apply
+acquire an exclusive lease, so they refuse to remove or reclassify a workspace
+while those operations are active. Leases are refreshed while work continues
+and expire after an abnormal process exit.
 
 Run a non-destructive classification report with:
 

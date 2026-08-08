@@ -50,6 +50,11 @@ try {
     conversationScopeId: "conversation-missing",
   });
   const cleanWorktree = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  const cleanWorktreeAlias = store.createSession({
+    id: "ws_clean_worktree_alias",
+    root: cleanWorktree.workspace.root,
+    mode: "checkout",
+  });
   const dirtyWorktree = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
   const unregisteredWorktree = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
   await writeFile(join(dirtyWorktree.workspace.root, "dirty.txt"), "keep me\n");
@@ -84,10 +89,24 @@ try {
   assert.equal(unregisteredEntry?.pathExists, true);
   assert.equal(unregisteredEntry?.registered, false);
 
+  store.setSessionStatus(cleanWorktreeAlias.id, "open");
+  await assert.rejects(
+    applyWorkspaceReconcile(config, store, workspaceActivity, [
+      missingCheckout.workspace.id,
+      cleanWorktree.workspace.id,
+      unregisteredWorktree.workspace.id,
+    ]),
+    (error: unknown) =>
+      error instanceof WorkspaceBusyError && error.reason === "open_alias",
+  );
+  assert.equal(store.getSession(missingCheckout.workspace.id)?.status, "detached");
+  assert.equal((await stat(cleanWorktree.workspace.root)).isDirectory(), true);
+  store.setSessionStatus(cleanWorktreeAlias.id, "detached");
+
   const activeLease = workspaceActivity.acquireShared(
-    cleanWorktree.workspace.id,
+    cleanWorktreeAlias.id,
     "operation",
-    "test-operation",
+    "alias-operation",
   );
   await assert.rejects(
     applyWorkspaceReconcile(config, store, workspaceActivity, [

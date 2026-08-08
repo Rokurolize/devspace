@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { workspaceResourceKey } from "./workspace-resource.js";
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1_000;
 
@@ -8,11 +9,13 @@ export type WorkspaceActivityKind = "operation" | "process" | "local_agent" | "c
 export class WorkspaceBusyError extends Error {
   constructor(
     readonly workspaceId: string,
-    readonly reason: "active" | "closing",
+    readonly reason: "active" | "closing" | "open_alias",
   ) {
     super(
       reason === "closing"
         ? `Workspace ${workspaceId} is being closed and cannot start new activity.`
+        : reason === "open_alias"
+          ? `Workspace ${workspaceId} shares its directory with another open workspace. Close that workspace before removing this one.`
         : `Workspace ${workspaceId} has active operations. Stop them before closing the workspace.`,
     );
     this.name = "WorkspaceBusyError";
@@ -103,38 +106,62 @@ export class WorkspaceActivityStore {
     exclusive: boolean,
   ): WorkspaceActivityLease {
     const leaseId = `wal_${randomUUID().replaceAll("-", "")}`;
-    const acquire = this.database.sqlite.transaction(() => {
-      const now = this.now();
-      this.deleteExpired(now);
-      const blocker = exclusive
-        ? this.database.sqlite
-            .prepare(
-              `select kind from workspace_activity_leases
-               where workspace_id = ? and expires_at > ?
-               limit 1`,
-            )
-            .get(workspaceId, now)
-        : this.database.sqlite
-            .prepare(
-              `select kind from workspace_activity_leases
-               where workspace_id = ? and kind = 'close' and expires_at > ?
-               limit 1`,
-            )
-            .get(workspaceId, now);
-      if (blocker) {
-        throw new WorkspaceBusyError(workspaceId, exclusive ? "active" : "closing");
-      }
+    const acquire = this.database.sqlite.transaction(
+      (): WorkspaceBusyError["reason"] | undefined => {
+        const now = this.now();
+        this.deleteExpired(now);
+        const resourceKey = this.resourceKey(workspaceId);
+        if (
+          exclusive &&
+          this.isManagedWorktree(workspaceId) &&
+          this.hasOpenAlias(workspaceId, resourceKey)
+        ) {
+          return "open_alias";
+        }
+        const blocker = exclusive
+          ? this.database.sqlite
+              .prepare(
+                `select kind from workspace_activity_leases
+                 where resource_key = ? and expires_at > ?
+                 limit 1`,
+              )
+              .get(resourceKey, now)
+          : this.database.sqlite
+              .prepare(
+                `select kind from workspace_activity_leases
+                 where resource_key = ? and kind = 'close' and expires_at > ?
+                 limit 1`,
+              )
+              .get(resourceKey, now);
+        if (blocker) {
+          return exclusive ? "active" : "closing";
+        }
 
-      const timestamp = new Date(now).toISOString();
-      this.database.sqlite
-        .prepare(
-          `insert into workspace_activity_leases (
-             lease_id, workspace_id, kind, owner_id, expires_at, created_at, updated_at
-           ) values (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(leaseId, workspaceId, kind, ownerId, now + this.ttlMs, timestamp, timestamp);
-    });
-    acquire.immediate();
+        const timestamp = new Date(now).toISOString();
+        this.database.sqlite
+          .prepare(
+            `insert into workspace_activity_leases (
+               lease_id, workspace_id, resource_key, kind, owner_id,
+               expires_at, created_at, updated_at
+             ) values (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            leaseId,
+            workspaceId,
+            resourceKey,
+            kind,
+            ownerId,
+            now + this.ttlMs,
+            timestamp,
+            timestamp,
+          );
+        return undefined;
+      },
+    );
+    const blockedReason = acquire.immediate();
+    if (blockedReason) {
+      throw new WorkspaceBusyError(workspaceId, blockedReason);
+    }
     return this.lease(leaseId, workspaceId, kind);
   }
 
@@ -182,6 +209,32 @@ export class WorkspaceActivityStore {
     this.database.sqlite
       .prepare("delete from workspace_activity_leases where expires_at <= ?")
       .run(now);
+  }
+
+  private resourceKey(workspaceId: string): string {
+    const session = this.database.sqlite
+      .prepare("select root from workspace_sessions where id = ?")
+      .get(workspaceId) as { root: string } | undefined;
+    return workspaceResourceKey(session?.root, workspaceId);
+  }
+
+  private hasOpenAlias(workspaceId: string, resourceKey: string): boolean {
+    const sessions = this.database.sqlite
+      .prepare(
+        `select id, root from workspace_sessions
+         where status = 'open' and id <> ?`,
+      )
+      .all(workspaceId) as Array<{ id: string; root: string }>;
+    return sessions.some(
+      (session) => workspaceResourceKey(session.root, session.id) === resourceKey,
+    );
+  }
+
+  private isManagedWorktree(workspaceId: string): boolean {
+    const session = this.database.sqlite
+      .prepare("select mode, managed from workspace_sessions where id = ?")
+      .get(workspaceId) as { mode: string; managed: string } | undefined;
+    return session?.mode === "worktree" && session.managed === "true";
   }
 }
 

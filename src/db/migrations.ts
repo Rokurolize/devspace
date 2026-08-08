@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { workspaceResourceKey } from "../workspace-resource.js";
 
 interface Migration {
   version: number;
@@ -36,6 +37,11 @@ const migrations: Migration[] = [
     version: 6,
     name: "workspace-activity-leases",
     up: migrateWorkspaceActivityLeases,
+  },
+  {
+    version: 7,
+    name: "workspace-activity-resources",
+    up: migrateWorkspaceActivityResources,
   },
 ];
 
@@ -232,6 +238,69 @@ function migrateWorkspaceActivityLeases(sqlite: Database.Database): void {
 
     create index if not exists workspace_activity_leases_workspace_expires_idx
       on workspace_activity_leases(workspace_id, expires_at);
+  `);
+}
+
+function migrateWorkspaceActivityResources(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table workspace_activity_leases_v7 (
+      lease_id text primary key,
+      workspace_id text not null,
+      resource_key text not null,
+      kind text not null,
+      owner_id text not null,
+      expires_at integer not null,
+      created_at text not null,
+      updated_at text not null
+    );
+  `);
+
+  const rows = sqlite
+    .prepare(
+      `select leases.lease_id, leases.workspace_id, leases.kind,
+              leases.owner_id, leases.expires_at, leases.created_at,
+              leases.updated_at, sessions.root
+       from workspace_activity_leases leases
+       left join workspace_sessions sessions on sessions.id = leases.workspace_id`,
+    )
+    .all() as Array<{
+      lease_id: string;
+      workspace_id: string;
+      kind: string;
+      owner_id: string;
+      expires_at: number;
+      created_at: string;
+      updated_at: string;
+      root: string | null;
+    }>;
+  const insert = sqlite.prepare(
+    `insert into workspace_activity_leases_v7 (
+       lease_id, workspace_id, resource_key, kind, owner_id,
+       expires_at, created_at, updated_at
+     ) values (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.lease_id,
+      row.workspace_id,
+      workspaceResourceKey(row.root ?? undefined, row.workspace_id),
+      row.kind,
+      row.owner_id,
+      row.expires_at,
+      row.created_at,
+      row.updated_at,
+    );
+  }
+
+  sqlite.exec(`
+    drop table workspace_activity_leases;
+    alter table workspace_activity_leases_v7 rename to workspace_activity_leases;
+
+    create index workspace_activity_leases_workspace_expires_idx
+      on workspace_activity_leases(workspace_id, expires_at);
+
+    create index if not exists workspace_activity_leases_resource_expires_idx
+      on workspace_activity_leases(resource_key, expires_at);
   `);
 }
 
