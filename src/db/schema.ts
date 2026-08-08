@@ -62,6 +62,7 @@ export const workspaceActivityLeases = sqliteTable(
   {
     leaseId: text("lease_id").primaryKey(),
     workspaceId: text("workspace_id").notNull(),
+    resourceKey: text("resource_key").notNull(),
     kind: text("kind").notNull(),
     ownerId: text("owner_id").notNull(),
     expiresAt: integer("expires_at").notNull(),
@@ -71,6 +72,10 @@ export const workspaceActivityLeases = sqliteTable(
   (table) => [
     index("workspace_activity_leases_workspace_expires_idx").on(
       table.workspaceId,
+      table.expiresAt,
+    ),
+    index("workspace_activity_leases_resource_expires_idx").on(
+      table.resourceKey,
       table.expiresAt,
     ),
   ],
