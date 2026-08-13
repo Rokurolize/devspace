@@ -187,7 +187,7 @@ previews in logs.
 the hashed OpenAI conversation scope, and a prefix of the hashed canonical
 workspace target key. The raw `openai/session` value is neither logged nor
 stored. MCP transports are capped at 256 live registry entries and idle entries
-are evicted after 30 minutes; these limits do not close persisted workspaces.
+are evicted after 24 hours; these limits do not close persisted workspaces.
 
 ## Workspace Lifecycle Maintenance
 

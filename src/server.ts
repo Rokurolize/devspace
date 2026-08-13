@@ -74,7 +74,7 @@ interface McpSessionContext {
 }
 // MCP clients can reconnect without closing the previous transport. Keep abandoned
 // transports short-lived and bounded independently from workspace persistence.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
+const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const MCP_SESSION_MAX_COUNT = 256;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -1907,7 +1907,10 @@ export function createServer(
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    // Trust only loopback proxies (local tunnels such as Tailscale Funnel and
+    // Cloudflared). express-rate-limit rejects the boolean `true` because it
+    // lets any client spoof X-Forwarded-For and bypass per-IP rate limits.
+    app.set("trust proxy", "loopback");
   }
 
   app.use((req, res, next) => {

@@ -255,3 +255,23 @@ npm run start
 separate Vite watch build running. Changes under `src/ui/` rebuild the app
 without restarting MCP sessions; backend source changes still restart the MCP
 server.
+
+### Dashboard
+
+`npm run dashboard` parses the server's JSONL serve logs (default
+`~/.devspace/devspace-serve.log` and `~/.devspace/logs/devspace-serve*.log`)
+and serves a read-only browser dashboard at `http://127.0.0.1:7677`. It shows,
+per workspaceId, the opened path, checkout/worktree mode, active/closed state,
+and the last executed command with its timestamp, plus a live timeline of
+recent tool calls.
+
+The dashboard reads the DevSpace state database
+(`~/.local/share/devspace/devspace.sqlite`, override with `--db`, disable with
+`--no-db`) read-only to recover workspace roots that were truncated out of the
+serve log by a server restart. It never writes to the server, its database, or
+its logs.
+
+```bash
+npm run dashboard                 # defaults above
+node scripts/dashboard.mjs --log /path/to/serve.log --port 8080
+```
