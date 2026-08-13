@@ -186,6 +186,9 @@ const toolNames = {
   shell: "bash",
 } as const;
 
+const workspaceIdDescription =
+  "Workspace to use. Reuse the current project's workspaceId.";
+
 interface ToolLogFields {
   tool: string;
   workspaceId?: string;
@@ -213,7 +216,7 @@ function serverInstructions(config: ServerConfig): string {
   const closeInstruction = ` Do not treat MCP disconnects or the end of a turn as workspace closure. Call ${toolNames.closeWorkspace} only when the user explicitly asks to release a workspace or managed worktree.`;
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -226,7 +229,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -580,9 +583,9 @@ function registerCodexProcessTools(
     {
       title: "Execute command",
       description:
-        "Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
+        "Run a command in a workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
       inputSchema: {
-        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        workspaceId: z.string().describe(workspaceIdDescription),
         cmd: z.string().min(1).describe("Shell command to execute."),
         tty: z
           .boolean()
@@ -741,7 +744,7 @@ export function createMcpServer(
       title: "DevSpace",
       version: "0.1.0",
       description:
-        "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
+        "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
     },
     {
       instructions: serverInstructions(config),
@@ -796,12 +799,12 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once before working in a project or worktree, then reuse the returned workspaceId for later file, search, edit, show-changes, and shell calls. By default this opens the actual checkout; set mode=\"worktree\" when you need isolated or parallel work. Open another workspace when changing projects, switching modes, or starting another isolated worktree.",
+        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
       inputSchema: {
         path: z
           .string()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
           ),
         mode: z
           .enum(["checkout", "worktree"])
@@ -889,16 +892,16 @@ export function createMcpServer(
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
       const cardInstruction = config.skillsEnabled
-        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
+        ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
+        : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
       const instruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
-            "Reuse this workspaceId for subsequent tool calls. This is the same checkout previously opened for this project in this conversation.",
-            "Continue following the project instructions, nested instruction files, skills, agent profiles, and diagnostics previously provided for this workspace. They remain the active workspace context and are not repeated here.",
+            "Continue with this workspaceId.",
+            "Keep following the project instructions, nested instruction files, skills, agent profiles, and diagnostics already provided for this workspace.",
           ].join("\n\n")
         : workspace.mode === "worktree"
-          ? "Use this workspaceId for subsequent tool calls. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for this isolated worktree."
+          ? "Use this workspaceId for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
       const resultContent: ToolContent[] = [
         {
@@ -1103,7 +1106,7 @@ export function createMcpServer(
       title: "Read file",
       description:
         [
-          "Read a file inside an open workspace. Use this for file inspection instead of shell commands like cat or sed. Call open_workspace first and pass workspaceId.",
+          "Read a file in a workspace. Use this for file inspection instead of shell commands like cat or sed.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
             ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
@@ -1114,7 +1117,7 @@ export function createMcpServer(
       inputSchema: {
         workspaceId: z
           .string()
-          .describe("Workspace identifier returned by open_workspace."),
+          .describe(workspaceIdDescription),
         path: z
           .string()
           .describe(
@@ -1202,11 +1205,11 @@ export function createMcpServer(
     {
       title: "Write file",
       description:
-        `Create or completely overwrite a file inside an open workspace. Prefer ${toolNames.edit} for targeted changes to existing files. Call open_workspace first and pass workspaceId.`,
+        `Create or completely overwrite a file in a workspace. Prefer ${toolNames.edit} for targeted changes to existing files.`,
       inputSchema: {
         workspaceId: z
           .string()
-          .describe("Workspace identifier returned by open_workspace."),
+          .describe(workspaceIdDescription),
         path: z
           .string()
           .describe("File path to write, relative to the workspace root."),
@@ -1278,11 +1281,11 @@ export function createMcpServer(
     {
       title: "Edit file",
       description:
-        `Edit one file inside an open workspace by replacing exact text blocks. Prefer this over ${toolNames.write} for targeted changes. Each oldText must match a unique, non-overlapping region of the original file; merge nearby changes into one edit and keep oldText as small as possible while still unique. Call open_workspace first and pass workspaceId.`,
+        `Edit one file in a workspace by replacing exact text blocks. Prefer this over ${toolNames.write} for targeted changes. Each oldText must match a unique, non-overlapping region of the original file; merge nearby changes into one edit and keep oldText as small as possible while still unique.`,
       inputSchema: {
         workspaceId: z
           .string()
-          .describe("Workspace identifier returned by open_workspace."),
+          .describe(workspaceIdDescription),
         path: z
           .string()
           .describe("File path to edit, relative to the workspace root."),
@@ -1372,11 +1375,11 @@ export function createMcpServer(
       {
         title: "Apply patch",
         description:
-          "Apply one Codex-style patch inside an open workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace. Call open_workspace first and pass workspaceId.",
+          "Apply one Codex-style patch in a workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace.",
         inputSchema: {
           workspaceId: z
             .string()
-            .describe("Workspace identifier returned by open_workspace."),
+            .describe(workspaceIdDescription),
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
@@ -1453,7 +1456,7 @@ export function createMcpServer(
         inputSchema: {
           workspaceId: z
             .string()
-            .describe("Workspace identifier returned by open_workspace."),
+            .describe(workspaceIdDescription),
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "show_changes"),
@@ -1506,11 +1509,11 @@ export function createMcpServer(
       {
         title: "Grep",
         description:
-          "Search file contents inside an open workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules. Call open_workspace first and pass workspaceId.",
+          "Search file contents in a workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules.",
         inputSchema: {
           workspaceId: z
             .string()
-            .describe("Workspace identifier returned by open_workspace."),
+            .describe(workspaceIdDescription),
           pattern: z.string().describe("Search pattern."),
           path: z
             .string()
@@ -1581,11 +1584,11 @@ export function createMcpServer(
       {
         title: "Glob",
         description:
-          "Find files by glob pattern inside an open workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules. Call open_workspace first and pass workspaceId.",
+          "Find files by glob pattern in a workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules.",
         inputSchema: {
           workspaceId: z
             .string()
-            .describe("Workspace identifier returned by open_workspace."),
+            .describe(workspaceIdDescription),
           pattern: z.string().describe("File glob pattern."),
           path: z
             .string()
@@ -1653,11 +1656,11 @@ export function createMcpServer(
       {
         title: "Ls",
         description:
-          "List a directory inside an open workspace. Use this for directory inspection before reading files. Call open_workspace first and pass workspaceId.",
+          "List a directory in a workspace. Use this for directory inspection before reading files.",
         inputSchema: {
           workspaceId: z
             .string()
-            .describe("Workspace identifier returned by open_workspace."),
+            .describe(workspaceIdDescription),
           path: z
             .string()
             .describe(
@@ -1723,12 +1726,12 @@ export function createMcpServer(
     {
       title: "Bash",
       description: config.toolMode !== "full"
-        ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-        : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+        ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
+        : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
       inputSchema: {
         workspaceId: z
           .string()
-          .describe("Workspace identifier returned by open_workspace."),
+          .describe(workspaceIdDescription),
         command: z
           .string()
           .describe(
