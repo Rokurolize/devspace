@@ -554,7 +554,7 @@ function renderWorkspacePayload(container: HTMLElement, card: ToolResultCard): v
       bareLogo: Boolean(logo),
       ariaLabel: name,
       tone: unavailable ? "muted" as const : undefined,
-      title: unavailable ? provider.reason ?? "Provider unavailable" : name,
+      title: unavailable ? provider.reason ?? "Provider unavailable" : provider.note ?? name,
     };
   });
 

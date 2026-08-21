@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
+import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
@@ -18,7 +19,10 @@ import { WorkspaceRegistry } from "./workspaces.js";
 const execFileAsync = promisify(execFile);
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
-  const context = await fixture(t);
+  const providerNote = "app-server support is verified on first run";
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true, note: providerNote }],
+  });
   const first = await callOpen(context.client, context.project, "chat-1");
   const repeated = await callOpen(context.client, context.project, "chat-1");
 
@@ -27,6 +31,10 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   const outputProperties = (openTool?.outputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
   assert.equal(outputProperties && "workspaceReused" in outputProperties, false);
   assert.equal(outputProperties && "includeBootstrapContext" in outputProperties, false);
+  const providerSchema = outputProperties?.agentProviders as {
+    items?: { properties?: Record<string, unknown> };
+  } | undefined;
+  assert.ok(providerSchema?.items?.properties?.note);
 
   const firstStructured = structuredContent(first);
   assert.equal(firstStructured.workspaceId, structuredContent(repeated).workspaceId);
@@ -34,6 +42,10 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(firstStructured.availableAgentsFiles));
   assert.ok(Array.isArray(firstStructured.skills));
   assert.ok(Array.isArray(firstStructured.agentProviders));
+  assert.equal(
+    (firstStructured.agentProviders as Array<Record<string, unknown>>)[0]?.note,
+    providerNote,
+  );
   assert.ok(Array.isArray(firstStructured.agents));
   assert.ok(Array.isArray(firstStructured.skillDiagnostics));
   assert.equal("workspaceReused" in firstStructured, false);
@@ -56,6 +68,10 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(card.availableAgentsFiles));
   assert.ok(Array.isArray(card.skills));
   assert.ok(Array.isArray(card.agentProviders));
+  assert.equal(
+    (card.agentProviders as Array<Record<string, unknown>>)[0]?.note,
+    providerNote,
+  );
   assert.ok(Array.isArray(card.agents));
 });
 
@@ -209,7 +225,10 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: { git?: boolean; localAgentProviders?: LocalAgentProviderAvailability[] } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -244,6 +263,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
     DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
@@ -255,7 +275,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     workspaces,
     createReviewCheckpointManager(),
     new ProcessSessionManager(),
-    [],
+    options.localAgentProviders ?? [],
     [],
     activity,
     "test",

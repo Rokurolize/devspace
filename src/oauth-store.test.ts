@@ -96,6 +96,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 5, name: "workspace-lifecycle" },
       { version: 6, name: "workspace-activity-leases" },
       { version: 7, name: "workspace-activity-resources" },
+      { version: 8, name: "local-agent-structured-errors" },
     ]);
   } finally {
     database.close();

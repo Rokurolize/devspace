@@ -43,6 +43,11 @@ const migrations: Migration[] = [
     name: "workspace-activity-resources",
     up: migrateWorkspaceActivityResources,
   },
+  {
+    version: 8,
+    name: "local-agent-structured-errors",
+    up: migrateLocalAgentStructuredErrors,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -302,6 +307,11 @@ function migrateWorkspaceActivityResources(sqlite: Database.Database): void {
     create index if not exists workspace_activity_leases_resource_expires_idx
       on workspace_activity_leases(resource_key, expires_at);
   `);
+}
+
+function migrateLocalAgentStructuredErrors(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "error_code", "text");
+  addColumnIfMissing(sqlite, "local_agent_sessions", "error_retryable", "text");
 }
 
 function addColumnIfMissing(
