@@ -158,12 +158,12 @@ test("checkout opened after a worktree receives its own complete context", async
   assert.equal(structuredContent(checkoutAgain).agentsFiles, undefined);
 });
 
-test("a host without conversation metadata receives normal explicit-workspace behavior", async (t) => {
+test("a host without conversation metadata still reuses by path", async (t) => {
   const context = await fixture(t);
   const first = await callOpen(context.client, context.project);
   const second = await callOpen(context.client, context.project);
 
-  assert.notEqual(structuredContent(first).workspaceId, structuredContent(second).workspaceId);
+  assert.equal(structuredContent(first).workspaceId, structuredContent(second).workspaceId);
   assert.ok(Array.isArray(structuredContent(first).agentsFiles));
   assert.ok(Array.isArray(structuredContent(second).agentsFiles));
   assert.doesNotMatch(responseText(first), /conversation metadata/i);

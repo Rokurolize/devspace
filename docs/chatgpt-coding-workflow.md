@@ -19,13 +19,14 @@ and shell calls should reuse that same `workspaceId`.
 
 ChatGPT may support automatic checkout recovery through optional host
 conversation metadata. This is an OpenAI-host adapter detail, not a standard MCP
-conversation field. When that optional context is available, opening the same
-checkout project again in the same conversation can continue in the existing
-workspace, and the context already provided for that reused checkout is not
-repeated. The portable workflow remains the same: keep using the `workspaceId`
-returned by `open_workspace` for later operations. Hosts without supported
-conversation context receive a normal new workspace and continue with that
-explicit `workspaceId` workflow.
+conversation field. DevSpace reuses the checkout workspace by canonical path, so
+opening the same checkout project again (in the same or a different
+conversation) continues in the existing workspace, and the context already
+provided for that reused checkout is not repeated for the same conversation. The
+portable workflow remains the same: keep using the `workspaceId` returned by
+`open_workspace` for later operations. Hosts without supported conversation
+context receive the same path-based reuse and continue with that explicit
+`workspaceId` workflow.
 The model receives actionable workspace instructions; automatic-reuse
 bookkeeping is not a model-facing choice.
 
@@ -60,6 +61,12 @@ Checkout mode is the default. DevSpace opens the actual directory:
 
 Use this when the user wants ChatGPT to work in the current checkout.
 
+Set `DEVSPACE_CHECKOUT_ONLY=1` (or `checkoutOnly: true` in
+`~/.devspace/config.json`) to force checkout mode for every open. Worktree mode
+is then not exposed at all: `open_workspace` omits `mode` and `baseRef`, and any
+requested worktree is opened as a checkout. Use this when ChatGPT should always
+work directly in the current checkout and never create isolated worktrees.
+
 ## Worktree Mode
 
 Use worktree mode for isolated parallel work:
@@ -87,7 +94,8 @@ actually required.
 
 Uncommitted source checkout changes are not copied into the managed worktree.
 DevSpace reports when the source checkout was dirty so the model can decide how
-to proceed with the user.
+to proceed with the user. When `DEVSPACE_CHECKOUT_ONLY=1` is set, worktree mode
+and this reporting are never exposed.
 
 ## Close a Workspace
 

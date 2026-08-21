@@ -214,9 +214,19 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
   const closeInstruction = ` Do not treat MCP disconnects or the end of a turn as workspace closure. Call ${toolNames.closeWorkspace} only when the user explicitly asks to release a workspace or managed worktree.`;
+  const reopenScope = config.checkoutOnly
+    ? "changing projects or when the current workspaceId is rejected"
+    : "changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected";
+  const openOnce = config.checkoutOnly
+    ? `Call ${toolNames.openWorkspace} once for each project folder, then keep using its workspaceId.`
+    : `Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId.`;
+  const reopenOnce = `Open another workspace only when ${reopenScope}.`;
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
+    const continuedWork = config.checkoutOnly
+      ? `During continued work in the same project, do not call ${toolNames.openWorkspace} again.`
+      : `During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again.`;
+    return `Use DevSpace for coding work. ${openOnce} ${continuedWork} ${reopenOnce} Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -229,7 +239,11 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
+  const continuedWork = config.checkoutOnly
+    ? `During continued work in the same project, do not call ${toolNames.openWorkspace} again.`
+    : `During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again.`;
+
+  return `Use DevSpace for coding work. ${openOnce} ${continuedWork} ${reopenOnce} ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${closeInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -803,25 +817,34 @@ export function createMcpServer(
     "open_workspace",
     {
       title: "Open workspace",
-      description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
-      inputSchema: {
-        path: z
-          .string()
-          .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
-          ),
-        mode: z
-          .enum(["checkout", "worktree"])
-          .optional()
-          .describe(
-            "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
-          ),
-        baseRef: z
-          .string()
-          .optional()
-          .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
-      },
+      description: config.checkoutOnly
+        ? "Start work in a project directory when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. This always uses the actual checkout directory."
+        : "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+      inputSchema: config.checkoutOnly
+        ? {
+            path: z
+              .string()
+              .describe(
+                "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
+              ),
+          }
+        : {
+            path: z
+              .string()
+              .describe(
+                "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
+              ),
+            mode: z
+              .enum(["checkout", "worktree"])
+              .optional()
+              .describe(
+                "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
+              ),
+            baseRef: z
+              .string()
+              .optional()
+              .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+          },
       outputSchema: {
         workspaceId: z.string(),
         root: z.string(),
@@ -848,7 +871,11 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => {
+    async (
+      args: { path: string; mode?: "checkout" | "worktree"; baseRef?: string },
+      { _meta }: { _meta?: unknown },
+    ) => {
+      const { path, mode, baseRef } = args;
       const startedAt = performance.now();
       const conversationScopeId = openAiConversationScopeId(_meta);
       const {

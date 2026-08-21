@@ -22,6 +22,7 @@ export interface ServerConfig {
   widgets: WidgetMode;
   stateDir: string;
   worktreeRoot: string;
+  checkoutOnly: boolean;
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
   skillsEnabled: boolean;
@@ -234,6 +235,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
+    checkoutOnly:
+      env.DEVSPACE_CHECKOUT_ONLY === undefined
+        ? files.config.checkoutOnly === true
+        : parseBoolean(env.DEVSPACE_CHECKOUT_ONLY),
     artifactsEnabled:
       env.DEVSPACE_ARTIFACTS === undefined
         ? files.config.artifactsEnabled === true

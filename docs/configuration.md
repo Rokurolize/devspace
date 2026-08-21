@@ -109,6 +109,19 @@ Codex-mode commands run without a PTY by default. Set `tty: true` on
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
 
+## Checkout-Only Mode
+
+`DEVSPACE_CHECKOUT_ONLY=1` (or `checkoutOnly: true` in `~/.devspace/config.json`)
+forces every `open_workspace` call to use checkout mode against the actual
+directory. Worktree mode is never exposed: the `open_workspace` tool omits the
+`mode` and `baseRef` parameters, and any worktree request is treated as a
+checkout. Use this when you want ChatGPT to always work directly in the current
+checkout and never create isolated worktrees.
+
+When enabled, the server instructions also stop mentioning worktree switching,
+so the model is not steered toward creating a worktree when a checkout has
+uncommitted changes.
+
 ## Widgets
 
 `DEVSPACE_WIDGETS` controls ChatGPT Apps iframe usage.

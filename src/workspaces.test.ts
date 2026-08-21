@@ -64,6 +64,25 @@ test("a checkout exposes initial and nested instruction context while filtering 
   }
 });
 
+test("a checkout walk skips nested git repositories when discovering instruction files", async (t) => {
+  const context = await fixture(t);
+  const gitProject = await createGitProject(context.root);
+  await mkdir(join(gitProject, "nested"));
+  await writeFile(join(gitProject, "nested", "AGENTS.md"), "git nested instructions\n");
+  await mkdir(join(context.root, "plain-nested"));
+  await writeFile(join(context.root, "plain-nested", "AGENTS.md"), "plain nested instructions\n");
+
+  const opened = await context.registry.openWorkspace(context.root);
+
+  assert.deepEqual(
+    opened.availableAgentsFiles.map((file) => file.path),
+    [
+      join(context.root, "nested", "AGENTS.md"),
+      join(context.root, "plain-nested", "AGENTS.md"),
+    ],
+  );
+});
+
 test("opening a missing checkout creates its workspace root", async (t) => {
   const context = await fixture(t);
   const missingRoot = join(context.root, "missing", "workspace");
@@ -71,6 +90,16 @@ test("opening a missing checkout creates its workspace root", async (t) => {
   const opened = await context.registry.openWorkspace(missingRoot);
   assert.equal(opened.workspace.root, missingRoot);
   assert.equal((await stat(missingRoot)).isDirectory(), true);
+});
+
+test("checkoutOnly config forces checkout mode even when worktree is requested", async (t) => {
+  const context = await fixture(t, { checkoutOnly: true });
+  const gitRoot = await createGitProject(context.root);
+
+  const opened = await context.registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+
+  assert.equal(opened.workspace.mode, "checkout");
+  assert.equal(opened.workspace.root, gitRoot);
 });
 
 test("worktree opens require Git and create an isolated managed workspace", async (t) => {
@@ -332,7 +361,10 @@ interface WorkspaceFixture {
   registry: WorkspaceRegistry;
 }
 
-async function fixture(t: TestContext): Promise<WorkspaceFixture> {
+async function fixture(
+  t: TestContext,
+  options: { checkoutOnly?: boolean } = {},
+): Promise<WorkspaceFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
   const outsideRoot = await mkdtemp(join(tmpdir(), "devspace-workspace-outside-test-"));
   const agentDir = join(root, ".pi", "agent");
@@ -371,6 +403,7 @@ async function fixture(t: TestContext): Promise<WorkspaceFixture> {
     DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_SUBAGENTS: "1",
+    ...(options.checkoutOnly ? { DEVSPACE_CHECKOUT_ONLY: "1" } : {}),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });

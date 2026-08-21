@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import { realpathSync, statSync, type Stats } from "node:fs";
 import { execFileSync } from "node:child_process";
 import type {
-  WorkspaceConversationBinding,
   WorkspaceMode,
   WorkspaceSession,
   WorkspaceStatus,
@@ -134,12 +133,7 @@ export class WorkspaceRegistry {
   ): Promise<WorkspaceContext> {
     const workspaceInput = typeof input === "string" ? { path: input } : input;
     const conversationScopeId = openOptions.conversationScopeId;
-    if (!conversationScopeId || !this.store) {
-      return this.openNewWorkspace(workspaceInput);
-    }
-
-    const projectKey = await this.conversationProjectKey(workspaceInput);
-    const mode = workspaceInput.mode ?? "checkout";
+    const mode = this.config.checkoutOnly ? "checkout" : workspaceInput.mode ?? "checkout";
     if (mode === "worktree") {
       const context = await this.openWorktreeWorkspace(workspaceInput.path, workspaceInput.baseRef);
       return {
@@ -149,19 +143,34 @@ export class WorkspaceRegistry {
       };
     }
 
+    if (!this.store) {
+      return this.openCheckoutWorkspace(workspaceInput.path);
+    }
+
+    const projectKey = await this.conversationProjectKey(workspaceInput);
     const targetKey = this.conversationCheckoutTargetKey(projectKey);
-    const operationKey = JSON.stringify([conversationScopeId, targetKey]);
+    const operationKey = JSON.stringify(["checkout", projectKey]);
     const pending = this.pendingCheckoutOpens.get(operationKey);
     if (pending) {
       const context = await pending;
+      const hadBinding = conversationScopeId
+        ? Boolean(this.store.getConversationBinding(conversationScopeId, targetKey))
+        : false;
+      if (conversationScopeId && !hadBinding) {
+        this.store.setConversationBinding({
+          conversationScopeId,
+          targetKey,
+          workspaceSessionId: context.workspace.id,
+        });
+      }
       return {
         ...context,
         workspaceReused: true,
-        includeBootstrapContext: false,
+        includeBootstrapContext: !hadBinding,
       };
     }
 
-    const open = this.openConversationCheckout(
+    const open = this.openCheckoutWorkspaceForPath(
       workspaceInput,
       conversationScopeId,
       targetKey,
@@ -177,25 +186,19 @@ export class WorkspaceRegistry {
     }
   }
 
-  private async openNewWorkspace(options: OpenWorkspaceInput): Promise<WorkspaceContext> {
-    const mode = options.mode ?? "checkout";
-
-    if (mode === "worktree") {
-      return this.openWorktreeWorkspace(options.path, options.baseRef);
-    }
-
-    return this.openCheckoutWorkspace(options.path);
-  }
-
-  private async openConversationCheckout(
+  private async openCheckoutWorkspaceForPath(
     input: OpenWorkspaceInput,
-    conversationScopeId: string,
+    conversationScopeId: string | undefined,
     targetKey: string,
   ): Promise<WorkspaceContext> {
-    const binding = this.store?.getConversationBinding(conversationScopeId, targetKey);
-    if (binding) {
-      const reusableWorkspace = await this.findReusableCheckoutWorkspace(binding);
-
+    // Same-conversation reuse first: this keeps the conversation's existing
+    // binding authoritative (and propagates unexpected storage/filesystem
+    // errors instead of mistaking them for a stale binding).
+    const binding = conversationScopeId
+      ? this.store?.getConversationBinding(conversationScopeId, targetKey)
+      : undefined;
+    if (binding && conversationScopeId) {
+      const reusableWorkspace = await this.findReusableCheckoutWorkspace(binding.workspaceSessionId);
       if (reusableWorkspace) {
         const context = await this.reusedWorkspaceContext(reusableWorkspace);
         this.store?.touchConversationBinding(conversationScopeId, targetKey);
@@ -209,22 +212,66 @@ export class WorkspaceRegistry {
       this.store?.deleteConversationBinding(conversationScopeId, targetKey);
     }
 
+    // Otherwise reuse any open checkout for the same canonical path, so the
+    // same path always maps to the same workspace across conversations.
+    const projectKey = await this.conversationProjectKey(input);
+    const reusableWorkspace = await this.findReusableCheckoutWorkspaceByPath(projectKey);
+    if (reusableWorkspace) {
+      if (conversationScopeId) {
+        this.store?.setConversationBinding({
+          conversationScopeId,
+          targetKey,
+          workspaceSessionId: reusableWorkspace.id,
+        });
+        this.store?.touchConversationBinding(conversationScopeId, targetKey);
+      }
+      const context = await this.reusedWorkspaceContext(reusableWorkspace);
+      return {
+        ...context,
+        includeBootstrapContext: true,
+      };
+    }
+
     const context = await this.openCheckoutWorkspace(input.path);
-    this.store?.setConversationBinding({
-      conversationScopeId,
-      targetKey,
-      workspaceSessionId: context.workspace.id,
-    });
+    if (conversationScopeId) {
+      this.store?.setConversationBinding({
+        conversationScopeId,
+        targetKey,
+        workspaceSessionId: context.workspace.id,
+      });
+    }
     return {
       ...context,
       includeBootstrapContext: true,
     };
   }
 
-  private async findReusableCheckoutWorkspace(
-    binding: WorkspaceConversationBinding,
+  private async findReusableCheckoutWorkspaceByPath(
+    projectKey: string,
   ): Promise<Workspace | undefined> {
-    const session = this.store?.getSession(binding.workspaceSessionId);
+    const sessions = this.store?.listSessions() ?? [];
+    for (const session of sessions) {
+      if (session.mode !== "checkout") continue;
+      if (session.status === "closed" || session.status === "orphaned") continue;
+
+      let sessionRoot: string;
+      try {
+        sessionRoot = await canonicalPath(session.root);
+      } catch {
+        continue;
+      }
+      if (sessionRoot !== projectKey) continue;
+
+      const workspace = await this.findReusableCheckoutWorkspace(session.id);
+      if (workspace) return workspace;
+    }
+    return undefined;
+  }
+
+  private async findReusableCheckoutWorkspace(
+    sessionId: string,
+  ): Promise<Workspace | undefined> {
+    const session = this.store?.getSession(sessionId);
     if (
       !session ||
       session.mode !== "checkout" ||
@@ -265,7 +312,7 @@ export class WorkspaceRegistry {
       throw error;
     }
 
-    const workspace = this.getWorkspace(binding.workspaceSessionId);
+    const workspace = this.getWorkspace(sessionId);
     if (workspace.mode !== "checkout" || workspace.root !== root) return undefined;
     return workspace;
   }
@@ -997,7 +1044,7 @@ async function walkWorkspace(
   for await (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      if (!SKIPPED_CONTEXT_DIRS.has(entry.name)) {
+      if (!SKIPPED_CONTEXT_DIRS.has(entry.name) && !(await isNestedGitRepository(path))) {
         await walkWorkspace(path, visit);
       }
       continue;
@@ -1005,6 +1052,12 @@ async function walkWorkspace(
 
     await visit(path, entry);
   }
+}
+
+async function isNestedGitRepository(path: string): Promise<boolean> {
+  // ponytail: nested git projects are skipped entirely; their instruction
+  // files are discovered via the git fast-path when opened as workspaces.
+  return (await tryLstat(join(path, ".git"))) !== undefined;
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {

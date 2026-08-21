@@ -26,13 +26,13 @@ test("a conversation reuses its checkout context", async (t) => {
   assert.deepEqual(second.workspace.agentProfiles, first.workspace.agentProfiles);
 });
 
-test("different conversations receive separate checkout workspaces", async (t) => {
+test("different conversations reuse the same checkout workspace for the same path", async (t) => {
   const { project, registry } = await fixture(t);
 
   const first = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
   const second = await registry.openWorkspace(project, { conversationScopeId: "chat-2" });
 
-  assert.notEqual(second.workspace.id, first.workspace.id);
+  assert.equal(second.workspace.id, first.workspace.id);
 });
 
 test("conversation bindings distinguish canonical projects", async (t) => {
@@ -72,13 +72,13 @@ test("concurrent checkout opens reuse one workspace and return matching context"
   assert.deepEqual(opens[0].availableAgentsFiles, opens[1].availableAgentsFiles);
 });
 
-test("a checkout without a conversation scope does not use conversation reuse", async (t) => {
+test("a checkout without a conversation scope still reuses by path", async (t) => {
   const { project, registry } = await fixture(t);
 
   const first = await registry.openWorkspace(project);
   const second = await registry.openWorkspace(project);
 
-  assert.notEqual(second.workspace.id, first.workspace.id);
+  assert.equal(second.workspace.id, first.workspace.id);
 });
 
 test("worktree requests remain fresh without replacing the reusable checkout", async (t) => {

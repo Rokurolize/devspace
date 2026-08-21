@@ -35,6 +35,9 @@ assert.equal(
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
+assert.equal(loadConfig(baseEnv).checkoutOnly, false);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHECKOUT_ONLY: "1" }).checkoutOnly, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHECKOUT_ONLY: "0" }).checkoutOnly, false);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents,
   true,
@@ -176,6 +179,7 @@ writeFileSync(
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
+    checkoutOnly: true,
   }),
 );
 writeFileSync(
@@ -192,6 +196,7 @@ assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
+assert.equal(fileConfig.checkoutOnly, true);
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
   "127.0.0.1",
